@@ -67,6 +67,9 @@
 #ifdef BUILD_BASIC
 #include "basic/basic.h"
 #endif
+#ifdef BUILD_ISPC
+#include "ispc/ispc.h"
+#endif
 #ifdef BUILD_PTHREAD
 #include "pthread/pocl-pthread.h"
 #endif
@@ -158,6 +161,9 @@ static init_device_ops pocl_devices_init_ops[] = {
 #ifdef BUILD_BASIC
   INIT_DEV (basic),
 #endif
+#ifdef BUILD_ISPC
+  INIT_DEV (ispc),
+#endif
 #ifdef BUILD_PTHREAD
   INIT_DEV (pthread),
 #endif
@@ -195,6 +201,9 @@ static init_device_ops pocl_devices_init_ops[] = {
 char pocl_device_types[POCL_NUM_DEVICE_TYPES][33] = {
 #ifdef BUILD_BASIC
   "basic",
+#endif
+#ifdef BUILD_ISPC
+  "ispc",
 #endif
 #ifdef BUILD_PTHREAD
   "pthread",

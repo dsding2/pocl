@@ -1809,6 +1809,7 @@ if(ENABLE_HOST_CPU_DEVICES)
   set(OCL_KERNEL_TARGET "${LLC_TRIPLE}") #The kernel target triplet.
   set(OCL_KERNEL_TARGET_CPU "${SELECTED_HOST_CPU}") #The kernel target CPU variant.
   set(BUILD_BASIC 1)
+  set(BUILD_ISPC 1)
   set(BUILD_PTHREAD 1)
 endif()
 
