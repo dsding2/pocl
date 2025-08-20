@@ -29,7 +29,10 @@
 unset(CMAKE_CXX_STANDARD)
 unset(CMAKE_CXX_STANDARD_REQUIRED)
 
-set(LLVMPASSES_SOURCES "AllocasToEntry.cc"
+set(LLVMPASSES_SOURCES 
+                       "AddIndirection.cc"
+                       "AddIndirection.hh"
+                       "AllocasToEntry.cc"
                        "AllocasToEntry.h"
                        "AutomaticLocals.cc"
                        "Barrier.h"
