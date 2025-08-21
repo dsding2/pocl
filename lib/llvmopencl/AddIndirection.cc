@@ -185,6 +185,7 @@ public:
       for (Instruction *DepInst : UserList) {
         vectorizeInstruction(DepInst, I, std::prev(Helper->arg_end()));
       }
+      I->eraseFromParent();
     }
     
     return true;
