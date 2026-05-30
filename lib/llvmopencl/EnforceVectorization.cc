@@ -24,6 +24,9 @@
 
 #include "CompilerWarnings.h"
 #include <llvm/ADT/APInt.h>
+#include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Instruction.h>
@@ -105,7 +108,6 @@ private:
 
     // Determines whether loads should be converted to wide loads or gathers
     bool isContiguous = true;
-    llvm::Value *mask;
   };
 
   using BasicBlockVector = std::vector<llvm::BasicBlock *>;
@@ -141,14 +143,22 @@ private:
   std::vector<std::pair<llvm::Value *, llvm::Value *>> GlobalIdInsts;
 
   std::map<llvm::Instruction *, GraphNode> InstGraph;
+  // Given a basic block, get a vector containing pairs of the form <predecessor, mask value from predecessor>
+  std::map<llvm::BasicBlock *, std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>>> BlockMaskPredecessors;
   std::map<llvm::BasicBlock *, llvm::Value *> BlockMasks;
+  // associates each loop with the mask before the loop began (since the mask needs to reset to that value afterwards)
+  std::map<llvm::Loop *, llvm::Value *> LoopMasks;
+  // bool checks if true in the branch instruction continues the loop.
+  std::unordered_map<llvm::BasicBlock *, bool> loopBranches;
+  std::unordered_set<llvm::BasicBlock *> alteredBranchedBlocks;
+  // Store all created calls that need a mask to be filled in later.
+  std::set<std::pair<llvm::CallInst *, int>> maskedCalls;
 
   bool processFunction(llvm::Function &F);
 
-  // void findBackedges(Loop *L);
-  // void handleLatchMask(BasicBlock *Header, BasicBlock *Latch);
+  void markLoop(Loop *L);
+  void handleLoopMask(Loop *L);
   Constant *createConstantMask(IRBuilder<> &Builder, int N);
-  // void initializeMasks();
 
   Value *createVectorScalarAdd(IRBuilder<> &builder, Value *Vec, Value *Scalar);
   void vectorizedHandleWorkitemFunctions();
@@ -169,9 +179,10 @@ private:
 
   void transformIdStores(BasicBlock *BB);
   void transformForInc(BasicBlock *BB);
-  void transformIdLoads(BasicBlock *BB);
+  void transformIdLoads();
   Instruction *findIncrementOfGlobal(BasicBlock *BB, GlobalVariable *GV);
   void findLoadsOfGlobal(GlobalVariable *GV, std::vector<Instruction *> &Loads);
+  void transformControlFlow(BasicBlock *BB);
 
   bool privatizeContext();
 };
@@ -180,11 +191,9 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   M = Func.getParent();
   F = &Func;
   Initialize(cast<Kernel>(&Func));
-  // WriteGraph(llvm::errs(), M, false);
-  // initialize vectorization member vars
-  // TODO add proper inference of gang size
 
-  GangSize = 4;
+  // TODO add proper inference of gang size
+  GangSize = 2;
   VectorizationDim = 0;
   // if (WGLocalSizeX >= WGLocalSizeY && WGLocalSizeX >= WGLocalSizeZ) {
   //   VectorizationDim = 0;
@@ -213,7 +222,9 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   VectorizedGlobalIdVar = cast<GlobalVariable>(M->getOrInsertGlobal(GID_G_NAME_VECTORIZED, VectorST));
   VectorizedLocalIdVar = cast<GlobalVariable>(M->getOrInsertGlobal(LID_G_NAME_VECTORIZED, VectorST));
 
-  // initializeMasks();
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    markLoop(L);
+  }
 
   bool Changed = processFunction(Func);
 
@@ -241,93 +252,18 @@ Constant *EnforceVectorizationImpl::createConstantMask(IRBuilder<> &Builder, int
   return ConstantVector::get(Elems);
 }
 
-// void EnforceVectorizationImpl::handleLatchMask(BasicBlock *Header, BasicBlock *Latch) {
-//   auto *TI = Latch->getTerminator();
-//   auto *BI = dyn_cast<BranchInst>(TI);
+void EnforceVectorizationImpl::markLoop(Loop *L) {
+  SmallVector<BasicBlock*, 4> exitingBlocks;
+  L->getExitingBlocks(exitingBlocks);
 
-//   if (!BI) {
-//     // Could be indirectbr, switch, unreachable, etc.
-//     return;
-//   }
+  assert(exitingBlocks.size() == 1);
+  BranchInst *br = dyn_cast<BranchInst>(exitingBlocks[0]->getTerminator());
+  assert(br && br->isConditional());
+  Value *cond = br->getCondition();
 
-//   if (!BI->isConditional()) {
-//     // Unconditional backedge (e.g., do { ... } while (true))
-//     return;
-//   }
-
-//   Value *Cond = BI->getCondition();
-//   ICmpInst *Cmp = dyn_cast<ICmpInst>(Cond);
-//   if (!Cmp) {
-//     return;
-//   }
-//   if (Cmp->getParent() != BI->getParent()) {
-//     return;
-//   }
-
-//   Value *Op0 = Cmp->getOperand(0);
-//   Value *Op1 = Cmp->getOperand(1);
-
-//   LoadInst *LI = nullptr;
-//   ConstantInt *CI = nullptr;
-
-//   if ((LI = dyn_cast<LoadInst>(Op0)))
-//     CI = dyn_cast<ConstantInt>(Op1);
-//   else if ((LI = dyn_cast<LoadInst>(Op1)))
-//     CI = dyn_cast<ConstantInt>(Op0);
-
-//   if (!LI || !CI)
-//     return; // pattern doesn't match
-
-//   Value *Ptr = LI->getPointerOperand();
-//   auto *GV = dyn_cast<GlobalVariable>(Ptr);
-//   if (!GV || (GV != GlobalIdIterators[VectorizationDim] && GV != LocalIdIterators[VectorizationDim])) {
-//     return;
-//   }
-  
-//   // Set up Dynamic Mask (the mask used and updated each loop)
-//   IRBuilder<> LatchBuilder(Cmp);
-//   Value *NumLeft = LatchBuilder.CreateSub(LI, CI);
-//   Constant *Sequential = makeSequentialVector();
-//   Value *TrailingSplat = LatchBuilder.CreateVectorSplat(GangSize, NumLeft);
-//   Value *DynMask = LatchBuilder.CreateICmpULT(Sequential, TrailingSplat);
-
-//   // Set up Initial Mask (the mask used for the first loop)
-//   Constant *InitialMask = createConstantMask(LatchBuilder, WGLocalSizeX);
-  
-//   // Set up mask PHI node
-//   IRBuilder<> HeaderBuilder(Header, Header->begin());
-//   unsigned NumPreds = std::distance(pred_begin(Header),
-//                                     pred_end(Header));
-//   PHINode *Phi = HeaderBuilder.CreatePHI(DynMask->getType(), NumPreds);
-//   for (BasicBlock *Pred : predecessors(Header)) {
-//     if (Pred == Latch)
-//       Phi->addIncoming(DynMask, Pred);
-//     else
-//       Phi->addIncoming(InitialMask, Pred);
-//   }
-//   // BlockMasks[Header] = Phi;
-//   BlockMasks[Header] = InitialMask;
-// }
-
-// void EnforceVectorizationImpl::findBackedges(Loop *L) {
-//   BasicBlock *Header = L->getHeader();
-//   for (BasicBlock *Pred : predecessors(Header)) {
-//     if (L->contains(Pred)) {
-//       handleLatchMask(Header, Pred);
-//     }
-//   }
-
-//   for (Loop *SubL : L->getSubLoops()) {
-//     findBackedges(SubL);
-//   }
-// }
-
-// void EnforceVectorizationImpl::initializeMasks() {
-//   for (auto &L : LI) {
-//     findBackedges(L);
-//   }
-
-// }
+  bool trueContinuesLoop = L->contains(br->getSuccessor(0));
+  loopBranches[exitingBlocks[0]] = trueContinuesLoop;
+}
 
 Constant *EnforceVectorizationImpl::makeSequentialVector() {
     std::vector<Constant*> Elements;
@@ -377,24 +313,39 @@ void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction* I) {
   // InstGraph[I].mask = InstGraph[oldVal].mask;
   // InstGraph[I].isContiguous = checkContiguous(I, oldVal);
 
+  // Handle branches
+  if (BranchInst *br = dyn_cast<BranchInst>(I)) {
+    if (br->isConditional()) {
+      alteredBranchedBlocks.insert(br->getParent());
+      Value *cond = br->getCondition();
+      Instruction *condInst = dyn_cast<Instruction>(cond);
+      if (condInst && InstGraph.count(condInst) > 0) {
+        // TODO conversion from array output to value output?
+        condInst = InstGraph[condInst].valueOutput;
+        IRBuilder<> Builder(condInst->getParent());
+
+        BlockMaskPredecessors[br->getSuccessor(0)].push_back(std::make_pair(I->getParent(), condInst));
+        Builder.SetInsertPoint(condInst->getNextNode());
+        Value *inv = Builder.CreateNot(condInst);
+        BlockMaskPredecessors[br->getSuccessor(1)].push_back(std::make_pair(I->getParent(), inv));
+        if (loopBranches.count(br->getParent()) > 0) {
+          Value *newBrCond = loopBranches[br->getParent()] ? Builder.CreateOrReduce(condInst) : Builder.CreateAndReduce(condInst);
+          Builder.SetInsertPoint(br);
+          Builder.CreateCondBr(newBrCond, br->getSuccessor(0), br->getSuccessor(1));
+          markedForDeletion.insert(br);
+        }
+
+      }
+    }
+    return;
+  }
+
   if (isVectorizableInstruction(I)) {
     vectorizedReplace(I);
   } else {
     unvectorizedReplace(I);
   }
 }
-
-// Only convert load, store, gather, and scatter
-// Instruction *EnforceVectorizationImpl::ConvertOpToMaskedIntrinsic(IRBuilder<> &Builder, Instruction *I, Value *op1, Value *op2) {
-//   VectorType *newType = dyn_cast<VectorType>(I->getType());
-//   if (!newType) {
-//     newType = VectorType::get(I->getType(), GangSize, false);
-//   }
-
-//   // Value *Operation = Builder.createO
-//   return Builder.CreateIntrinsic(vp_opcode, newType, {op1, op2, InstGraph[I].mask, Builder.getInt32(newType->getElementCount().getFixedValue())});
-
-// }
 
 #define SPLAT_OPERAND(idx) \
 if (!newOperands[idx]->getType()->isVectorTy()) { \
@@ -403,9 +354,30 @@ if (!newOperands[idx]->getType()->isVectorTy()) { \
 // assumes the opcode is vectorizable, and that the operands are either vectors or vectorizable
 // returns new instruction
 void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction* I) {
-  llvm::IRBuilder<> Builder(I);
 
   std::vector<Value *> newOperands;
+
+  // We need to insert all new instructions after the transformations of all of their operands. Thus, find the latest operand.
+  Instruction *latestOperand = I;
+  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+    Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(i));
+    if (operandInst && InstGraph.count(operandInst) > 0) {
+      // convert arrayOutput to valueOutput
+      if (!HAS_VALUE_OUTPUT(InstGraph[operandInst])) {
+        std::vector<Instruction *>& oldValOutputs = InstGraph[operandInst].arrayOutput;
+        if (latestOperand->comesBefore(oldValOutputs.back())) {
+          latestOperand = oldValOutputs.back();
+        }
+      } else {
+        if (latestOperand->comesBefore(InstGraph[operandInst].valueOutput)) {
+          latestOperand = InstGraph[operandInst].valueOutput;
+        }
+      }
+    }
+  }
+  llvm::IRBuilder<> Builder(latestOperand->getNextNode());
+
+
   for (unsigned i = 0; i < I->getNumOperands(); ++i) {
     Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(i));
     if (operandInst && InstGraph.count(operandInst) > 0) {
@@ -419,9 +391,6 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction* I) {
           vec = Builder.CreateInsertElement(vec, oldValOutputs[i],
                                             Builder.getInt32(i));
         }
-        // In theory, all masks of operands should be the same, so we can pick
-        // one arbitrarily to propagate
-        InstGraph[I].mask = InstGraph[operandInst].mask;
         InstGraph[operandInst].valueOutput = cast<Instruction>(vec);
       }
       newOperands.push_back(InstGraph[operandInst].valueOutput);
@@ -441,11 +410,20 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction* I) {
   } else if (I->getOpcode() == Instruction::Load) {
     VectorType *vectorizedType = VectorType::get(I->getType(), GangSize, false);
     SPLAT_OPERAND(0);
-    newInst = cast<Instruction>(Builder.CreateMaskedGather(vectorizedType, newOperands[0], Align(4), InstGraph[I].mask, PoisonValue::get(vectorizedType)));
+    auto newCallInst = Builder.CreateMaskedGather(vectorizedType, newOperands[0], Align(4), NULL, PoisonValue::get(vectorizedType));
+    maskedCalls.insert(std::make_pair(newCallInst, 2));
+    newInst = cast<Instruction>(newCallInst);
   } else if (I->getOpcode() == Instruction::Store) {
     SPLAT_OPERAND(0);
     SPLAT_OPERAND(1);
-    newInst = cast<Instruction>(Builder.CreateMaskedScatter(newOperands[0], newOperands[1], Align(4), InstGraph[I].mask)); 
+    auto newCallInst = Builder.CreateMaskedScatter(newOperands[0], newOperands[1], Align(4), NULL);
+    maskedCalls.insert(std::make_pair(newCallInst, 3));
+    newInst = cast<Instruction>(newCallInst);
+  } else if (isa<CmpInst>(I)) {
+    SPLAT_OPERAND(0);
+    SPLAT_OPERAND(1);
+    CmpInst *ICMP = cast<CmpInst>(I);
+    newInst = cast<Instruction>(Builder.CreateICmp(ICMP->getPredicate(), newOperands[0], newOperands[1]));
   } else if (Instruction::isBinaryOp(I->getOpcode())) {
     SPLAT_OPERAND(0);
     SPLAT_OPERAND(1);
@@ -456,6 +434,8 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction* I) {
   } else if (Instruction::isCast(I->getOpcode())) {
     SPLAT_OPERAND(0);
     newInst = cast<Instruction>(Builder.CreateCast((llvm::Instruction::CastOps)I->getOpcode(), newOperands[0], I->getType()));
+  } else {
+    assert(false);
   }
 
   markedForDeletion.insert(I);
@@ -463,7 +443,26 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction* I) {
 }
 
 void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction* I) {
-  IRBuilder<> Builder(I);
+  // We need to insert all new instructions after the transformations of all of their operands. Thus, find the latest operand.
+  Instruction *latestOperand = I;
+  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+    Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(i));
+    if (operandInst && InstGraph.count(operandInst) > 0) {
+      // convert arrayOutput to valueOutput
+      if (!HAS_ARRAY_OUTPUT(InstGraph[operandInst])) {
+        if (latestOperand->getParent() == InstGraph[operandInst].valueOutput->getParent() && latestOperand->comesBefore(InstGraph[operandInst].valueOutput)) {
+          latestOperand = InstGraph[operandInst].valueOutput;
+        }
+      } else {
+        std::vector<Instruction *>& oldValOutputs = InstGraph[operandInst].arrayOutput;
+        if (latestOperand->getParent() == oldValOutputs.back()->getParent() && latestOperand->comesBefore(oldValOutputs.back())) {
+          latestOperand = oldValOutputs.back();
+        }
+      }
+    }
+  }
+  IRBuilder<> Builder(latestOperand->getNextNode());
+  // IRBuilder<> Builder(I);
 
   std::unordered_map<int, std::vector<Instruction *>> changedOperands;
 
@@ -513,6 +512,7 @@ bool EnforceVectorizationImpl::isVectorizableInstruction(Instruction *I) {
     case Instruction::Shl:
     case Instruction::AShr:
     case Instruction::LShr:
+    case Instruction::ICmp:
     case Instruction::Load:
     case Instruction::Store:
     // In theory, there should be a vectorized version of GEP, but I can't figure out the semantics
@@ -636,25 +636,26 @@ void EnforceVectorizationImpl::findLoadsOfGlobal(GlobalVariable *GV, std::vector
       BasicBlock *BB = LI->getParent();
       if (auto *M = BB->getTerminator()->getMetadata("myrole")) {
         auto *S = dyn_cast<MDString>(M->getOperand(0));
-        if (!S || (S->getString() != "pregion_for_inc" && S->getString() != "pregion_for_init" && S->getString() != "pregion_for_cond")) {
-          Loads.push_back(LI);
+        if (S && (S->getString() == "pregion_for_inc" || S->getString() == "pregion_for_init")) {
+          continue;
         }
       }
+      Loads.push_back(LI);
     }
   }
 }
 
 // Starting with every load of the global and local id values, recursively walk the
 // data flow graph, applying vectorization to every instruction found.
-void EnforceVectorizationImpl::transformIdLoads(BasicBlock *BB) {
-  IRBuilder<> Builder(BB);
-  Builder.SetInsertPoint(BB->getFirstInsertionPt());
+void EnforceVectorizationImpl::transformIdLoads() {
+  IRBuilder<> Builder(M->getContext());
 
   std::unordered_set<Instruction *> AllVectorizableLoads;
   std::vector<Instruction *> GlobalIteratorLoads;
   findLoadsOfGlobal(GlobalIdIterators[VectorizationDim], GlobalIteratorLoads);
   std::unordered_set<Instruction *> visited;
   for (Instruction *LoadInst : GlobalIteratorLoads) {
+    Builder.SetInsertPoint(LoadInst);
     Instruction *globalLoad = Builder.CreateLoad(VectorST, VectorizedGlobalIdVar);
     InstGraph[LoadInst].valueOutput = globalLoad;
     AllVectorizableLoads.insert(LoadInst);
@@ -664,16 +665,14 @@ void EnforceVectorizationImpl::transformIdLoads(BasicBlock *BB) {
   std::vector<Instruction *> LocalIteratorLoads;
   findLoadsOfGlobal(LocalIdIterators[VectorizationDim], LocalIteratorLoads);
   for (Instruction *LoadInst : LocalIteratorLoads) {
+    Builder.SetInsertPoint(LoadInst);
     Instruction *globalLoad = Builder.CreateLoad(VectorST, VectorizedLocalIdVar);
     InstGraph[LoadInst].valueOutput = globalLoad;
     AllVectorizableLoads.insert(LoadInst);
     traverseInstructionTree(LoadInst, visited);
   }
   
-  // Topological sort. Currently, we assume no loops via PHI nodes. TODO: add explicit loop
-  // checks when handling masking and other control flow stuff
-
-  // start with nodes that have no dependencies
+  // Topological sort
   SmallVector<Instruction*> Worklist;
   for (auto &LoadInst : AllVectorizableLoads) {
     Worklist.push_back(LoadInst);
@@ -689,23 +688,8 @@ void EnforceVectorizationImpl::transformIdLoads(BasicBlock *BB) {
     }
   }
 
-  // Value *initialMask = Constant::getAllOnesValue(VectorType::get(Builder.getInt1Ty(), GangSize, false));
-  // if (WGLocalSizeX < GangSize) {
-  //   SmallVector<Constant *, 16> MaskEls;
-  //   for (unsigned lane = 0; lane < GangSize; ++lane) {
-  //     MaskEls.push_back(Builder.getInt1(lane < WGLocalSizeX));
-  //   }
-  //   initialMask = ConstantVector::get(MaskEls);
-  // }
-
-  for (Instruction *I : AllVectorizableLoads) {
-    if (BlockMasks.find(I->getParent()) != BlockMasks.end()) {
-      InstGraph[I].mask = BlockMasks[I->getParent()];
-    } else {
-      InstGraph[I].mask = createConstantMask(Builder, GangSize);
-    }
-  }
-
+  // Masking is handled in two stages. The first stage happens during the recursive vectorizeInstruction,
+  // which figures out the masks for conditional branches, and sets up needed information for CFG loops.
   for (Instruction *I : TopoOrder) {
     // Don't try to vectorize the initial loads from the global/local IDs.
     if (AllVectorizableLoads.count(I) == 0) {
@@ -713,10 +697,77 @@ void EnforceVectorizationImpl::transformIdLoads(BasicBlock *BB) {
     }
   }
 
-  for (Instruction *inst : markedForDeletion) {
+  // This is the second stage, which traverses the blocks in approximate order, and fills out the masking.
+  // Generally, just use a phi node set to inherit the right mask from the predecessor.
+  // In the case of loops, the preprocessing in the first stage should avoid dependency cycles.
+  ReversePostOrderTraversal<Function*> RPOT(F);
+
+  for (BasicBlock *BB : RPOT) {
+    IRBuilder<> Builder(&*BB->begin());
+    unsigned numPreds = std::distance(pred_begin(BB), pred_end(BB));
+    if (numPreds == 0) {
+      // Right now, we take all enabled as default. This breaks if GangSize < GlobalSize, and maybe some other edge cases
+      BlockMasks[BB] = createConstantMask(Builder, GangSize);
+      continue;
+    }
+    PHINode *phi = Builder.CreatePHI(VectorType::get(Builder.getInt1Ty(), GangSize, false), numPreds);
+    std::unordered_set<BasicBlock *> filledPredecessors;
+    for (auto &[Pred, V] : BlockMaskPredecessors[BB]) {
+      filledPredecessors.insert(Pred);
+      phi->addIncoming(V, Pred);
+    }
+    for (BasicBlock *Pred : predecessors(BB)) {
+      // For each predecessor, if it is loop exiting, then override the inherited mask value to
+      // be the mask of the loop header (i.e. reset the mask to the start of the loop)
+      // Otherwise, simply inherit the last block's mask if not already set.
+      for (Loop *L = LI.getLoopFor(Pred); L; L = L->getParentLoop()) {
+        if (L->isLoopExiting(Pred) && !L->contains(BB)) {
+          if (filledPredecessors.count(Pred) == 0) {
+            phi->addIncoming(LoopMasks[L], Pred);
+          } else {
+            phi->setIncomingValueForBlock(Pred, LoopMasks[L]);
+          }
+          filledPredecessors.insert(Pred);
+          break;
+        }
+      }
+      if (filledPredecessors.count(Pred) == 0) {
+        phi->addIncoming(BlockMasks[Pred], Pred);
+      }
+    }
+
+    // Handle loop mask. At the exit of the loop, the mask should reset to the mask value before the loop, requiring
+    // this additional work to maintain that value
+    for (Loop *L = LI.getLoopFor(BB); L; L = L->getParentLoop()) {
+      if (L->getHeader() == BB) {
+        PHINode *phiClone = cast<PHINode>(phi->clone());
+        for (BasicBlock *Pred : predecessors(BB)) {
+          if (L->contains(Pred)) {
+            phiClone->setIncomingValueForBlock(Pred, phiClone);
+          }
+        }
+        LoopMasks[L] = phiClone;
+        Builder.Insert(phiClone);
+      }
+    }
+    BlockMasks[BB] = phi;
+  }
+
+  for (auto&[maskedCall, maskIdx] : maskedCalls) {
+    maskedCall->setArgOperand(maskIdx, BlockMasks[maskedCall->getParent()]);
+  }
+
+  llvm::SmallVector<llvm::Instruction *> deletion_vec(markedForDeletion.begin(), markedForDeletion.end());
+  for (int i = 0; i < deletion_vec.size(); i++) {
+    Instruction *inst = deletion_vec[i];
     inst->replaceAllUsesWith(PoisonValue::get(inst->getType()));
     inst->eraseFromParent();
-    // InstGraph[I].markedForDeletion.pop_back();
+  }
+}
+
+void EnforceVectorizationImpl::transformControlFlow(BasicBlock *BB) {
+  if (loopBranches.count(BB) > 0) {
+    return;
   }
 }
 
@@ -777,9 +828,7 @@ bool EnforceVectorizationImpl::processFunction(Function &F) {
     transformForInc(BB);
   }
 
-  for (BasicBlock *BB : forBodyBlocks) {
-    transformIdLoads(BB);
-  }
+  transformIdLoads();
   return true;
 }
 
