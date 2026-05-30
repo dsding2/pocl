@@ -330,7 +330,21 @@ void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
       Value *cond = br->getCondition();
       Instruction *condInst = dyn_cast<Instruction>(cond);
       if (condInst && InstGraph.count(condInst) > 0) {
-        // TODO conversion from array output to value output?
+        // conversion from array output to value output
+        if (!HAS_VALUE_OUTPUT(InstGraph[condInst])) {
+          std::vector<Instruction *> &oldValOutputs =
+              InstGraph[condInst].arrayOutput;
+          IRBuilder<> Builder(oldValOutputs.back()->getNextNode());
+          Type *elemTy = oldValOutputs[0]->getType();
+          VectorType *vecTy = VectorType::get(elemTy, GangSize, false);
+          Value *vec = UndefValue::get(vecTy);
+          for (unsigned i = 0; i < GangSize; i++) {
+            vec = Builder.CreateInsertElement(vec, oldValOutputs[i],
+                                              Builder.getInt32(i));
+          }
+          InstGraph[condInst].valueOutput = cast<Instruction>(vec);
+        }
+
         condInst = InstGraph[condInst].valueOutput;
         IRBuilder<> Builder(condInst->getParent());
 
@@ -750,7 +764,10 @@ void EnforceVectorizationImpl::transformIdLoads() {
   // and fills out the masking. Generally, just use a phi node set to inherit
   // the right mask from the predecessor. In the case of loops, the
   // preprocessing in the first stage should avoid dependency cycles.
+
+  // TODO: Convert this to a worklist method, using RPOT as the initial worklist.
   ReversePostOrderTraversal<Function *> RPOT(F);
+  // llvm::SmallVector<BasicBlock *> worklist;
 
   for (BasicBlock *BB : RPOT) {
     IRBuilder<> Builder(&*BB->begin());
