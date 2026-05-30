@@ -38,6 +38,7 @@ IGNORE_COMPILER_WARNING("-Wmaybe-uninitialized")
 POP_COMPILER_DIAGS
 IGNORE_COMPILER_WARNING("-Wunused-parameter")
 #include <llvm/ADT/Statistic.h>
+#include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/DataLayout.h>
@@ -158,6 +159,7 @@ private:
   std::unordered_set<llvm::BasicBlock *> alteredBranchedBlocks;
   // Store all created calls that need a mask to be filled in later.
   std::set<std::pair<llvm::CallInst *, int>> maskedCalls;
+  std::unordered_set<llvm::BranchInst *> branchInsts;
 
   bool processFunction(llvm::Function &F);
 
@@ -201,7 +203,7 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   Initialize(cast<Kernel>(&Func));
 
   // TODO add proper inference of gang size
-  GangSize = 2;
+  GangSize = 4;
   VectorizationDim = 0;
   // if (WGLocalSizeX >= WGLocalSizeY && WGLocalSizeX >= WGLocalSizeZ) {
   //   VectorizationDim = 0;
@@ -346,6 +348,8 @@ void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
           Builder.CreateCondBr(newBrCond, br->getSuccessor(0),
                                br->getSuccessor(1));
           markedForDeletion.insert(br);
+        } else {
+          branchInsts.insert(br);
         }
       }
     }
@@ -371,23 +375,23 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
 
   // We need to insert all new instructions after the transformations of all of
   // their operands. Thus, find the latest operand.
-  Instruction *latestOperand = I;
-  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-    auto *operandInst = dyn_cast<Instruction>(I->getOperand(i));
-    if (!operandInst || !InstGraph.count(operandInst))
-      continue;
+  Instruction *insertPoint = I->getNextNode();
+  // for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+  //   auto *operandInst = dyn_cast<Instruction>(I->getOperand(i));
+  //   if (!operandInst || !InstGraph.count(operandInst))
+  //     continue;
 
-    Instruction *candidate =
-        !HAS_VALUE_OUTPUT(InstGraph[operandInst])
-            ? candidate = InstGraph[operandInst].arrayOutput.back()
-            : candidate = InstGraph[operandInst].valueOutput;
+  //   Instruction *candidate =
+  //       !HAS_VALUE_OUTPUT(InstGraph[operandInst])
+  //           ? candidate = InstGraph[operandInst].arrayOutput.back()
+  //           : candidate = InstGraph[operandInst].valueOutput;
 
-    if (candidate && latestOperand->getParent() == candidate->getParent() &&
-        latestOperand->comesBefore(candidate)) {
-      latestOperand = candidate;
-    }
-  }
-  llvm::IRBuilder<> Builder(latestOperand->getNextNode());
+  //   if (candidate && latestOperand->getParent() == candidate->getParent() &&
+  //       latestOperand->comesBefore(candidate)) {
+  //     latestOperand = candidate;
+  //   }
+  // }
+  llvm::IRBuilder<> Builder(insertPoint);
 
   for (unsigned i = 0; i < I->getNumOperands(); ++i) {
     Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(i));
@@ -399,10 +403,12 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
         Type *elemTy = oldValOutputs[0]->getType();
         VectorType *vecTy = VectorType::get(elemTy, GangSize, false);
         Value *vec = UndefValue::get(vecTy);
+        Builder.SetInsertPoint(oldValOutputs.back()->getNextNode());
         for (unsigned i = 0; i < GangSize; i++) {
           vec = Builder.CreateInsertElement(vec, oldValOutputs[i],
                                             Builder.getInt32(i));
         }
+        Builder.SetInsertPoint(insertPoint);
         InstGraph[operandInst].valueOutput = cast<Instruction>(vec);
       }
       newOperands.push_back(InstGraph[operandInst].valueOutput);
@@ -467,22 +473,21 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
 void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
   // We need to insert all new instructions after the transformations of all of
   // their operands. Thus, find the latest operand.
-  Instruction *latestOperand = I;
-  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-    auto *operandInst = dyn_cast<Instruction>(I->getOperand(i));
-    if (!operandInst || InstGraph.count(operandInst) == 0)
-      continue;
+  Instruction *insertPoint = I->getNextNode();
+  // for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+  //   auto *operandInst = dyn_cast<Instruction>(I->getOperand(i));
+  //   if (!operandInst || InstGraph.count(operandInst) == 0)
+  //     continue;
 
-    Instruction *Candidate = HAS_ARRAY_OUTPUT(InstGraph[operandInst])
-                                 ? InstGraph[operandInst].arrayOutput.back()
-                                 : InstGraph[operandInst].valueOutput;
+  //   Instruction *Candidate = HAS_ARRAY_OUTPUT(InstGraph[operandInst])
+  //                                ? InstGraph[operandInst].arrayOutput.back()
+  //                                : InstGraph[operandInst].valueOutput;
 
-    if (Candidate && latestOperand->getParent() == Candidate->getParent() &&
-        latestOperand->comesBefore(Candidate))
-      latestOperand = Candidate;
-  }
-  IRBuilder<> Builder(latestOperand->getNextNode());
-  // IRBuilder<> Builder(I);
+  //   if (Candidate && latestOperand->getParent() == Candidate->getParent() &&
+  //       latestOperand->comesBefore(Candidate))
+  //     latestOperand = Candidate;
+  // }
+  IRBuilder<> Builder(insertPoint);
 
   std::unordered_map<int, std::vector<Instruction *>> changedOperands;
 
@@ -492,6 +497,8 @@ void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
       // convert valueOutput to vectorOutput
       std::vector<Instruction *> unpackedOperand;
       if (!HAS_ARRAY_OUTPUT(InstGraph[operandInst])) {
+        Builder.SetInsertPoint(
+            InstGraph[operandInst].valueOutput->getNextNode());
         for (unsigned i = 0; i < GangSize; ++i) {
           Instruction *ExtractedElem =
               cast<Instruction>(Builder.CreateExtractElement(
@@ -499,6 +506,7 @@ void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
           unpackedOperand.push_back(ExtractedElem);
         }
         InstGraph[operandInst].arrayOutput = unpackedOperand;
+        Builder.SetInsertPoint(insertPoint);
       }
 
       changedOperands[i] = InstGraph[operandInst].arrayOutput;
@@ -797,6 +805,54 @@ void EnforceVectorizationImpl::transformIdLoads() {
       }
     }
     BlockMasks[BB] = phi;
+  }
+
+  // After setting up all the masks with the phi, we need to merge branches into
+  // a single straight line path.
+  for (BranchInst *br : branchInsts) {
+    BasicBlock *trueBB = br->getSuccessor(0);
+    BasicBlock *falseBB = br->getSuccessor(1);
+    BasicBlock *mergeBB = PDT.findNearestCommonDominator(trueBB, falseBB);
+
+    std::unordered_set<BasicBlock *> trueBBMergePreds;
+    std::unordered_set<BasicBlock *> falseBBMergePreds;
+    for (BasicBlock *Pred : predecessors(mergeBB)) {
+      if (Pred == mergeBB)
+        continue;
+
+      SmallPtrSet<BasicBlock *, 1> exclusionSet({mergeBB});
+      if (isPotentiallyReachable(trueBB, Pred, &exclusionSet)) {
+        trueBBMergePreds.insert(Pred);
+      }
+      if (isPotentiallyReachable(falseBB, Pred, &exclusionSet)) {
+        falseBBMergePreds.insert(Pred);
+      }
+    }
+
+    PHINode *falsePhiNode = cast<PHINode>(BlockMasks[falseBB]);
+    Value *falseMask = falsePhiNode->getIncomingValueForBlock(br->getParent());
+    falsePhiNode->removeIncomingValue(br->getParent(), false);
+
+    PHINode *MergeMask = cast<PHINode>(BlockMasks[mergeBB]);
+    for (BasicBlock *trueBBMergePred : trueBBMergePreds) {
+      BranchInst *mergePredBr =
+          cast<BranchInst>(trueBBMergePred->getTerminator());
+      for (int i = 0; i < mergePredBr->getNumSuccessors(); i++) {
+        if (mergePredBr->getSuccessor(i) == mergeBB) {
+          mergePredBr->setSuccessor(i, falseBB);
+        }
+      }
+      MergeMask->removeIncomingValue(trueBBMergePred, false);
+      falsePhiNode->addIncoming(falseMask, trueBBMergePred);
+    }
+
+    for (BasicBlock *falseBBMergePred : falseBBMergePreds) {
+      MergeMask->setIncomingValueForBlock(falseBBMergePred, BlockMasks[br->getParent()]);
+    }
+
+    Builder.SetInsertPoint(br);
+    Builder.CreateBr(trueBB);
+    br->eraseFromParent();
   }
 
   for (auto &[maskedCall, maskIdx] : maskedCalls) {
