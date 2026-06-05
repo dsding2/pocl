@@ -362,6 +362,8 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
     return;
   }
 
+  BasicBlock *BB = br->getParent();
+
   Value *cond = br->getCondition();
   Instruction *condInst = dyn_cast<Instruction>(cond);
   if (condInst && InstGraph.count(condInst) > 0) {
@@ -383,27 +385,35 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
     condInst = InstGraph[condInst].valueOutput;
     IRBuilder<> Builder(condInst->getParent());
 
-    BlockMaskPredecessors[br->getSuccessor(0)][br->getParent()] = condInst;
-    Builder.SetInsertPoint(condInst->getNextNode());
-    Value *inv = Builder.CreateNot(condInst);
-    BlockMaskPredecessors[br->getSuccessor(1)][br->getParent()] = inv;
     if (loopBranches.count(br->getParent()) > 0) {
+      Builder.SetInsertPoint(br);
       // For loop predicates, any false means that all future mask values must also be false.
       // TODO: change this to only apply to branches in the for_cond blocks.
       // For other blocks, you must set it up such that if a mask value is false, it will be false forever.
       if (blockHasTag(br->getParent(), "pregion_for_cond")) {
         Value *newLoopPredicate = constructLoopPredicatePrefix(Builder, condInst);
-        BlockMaskPredecessors[br->getSuccessor(0)][br->getParent()] = newLoopPredicate;
-        BlockMaskPredecessors[br->getSuccessor(1)][br->getParent()] = nullptr;
+        cast<PHINode>(BlockMasks[br->getSuccessor(0)])->addIncoming(newLoopPredicate, BB);
+        // BlockMaskPredecessors[br->getSuccessor(1)][br->getParent()] = nullptr;
         Value *newBrCond = Builder.CreateOrReduce(newLoopPredicate);
-        Builder.SetInsertPoint(br);
-        Builder.CreateCondBr(newBrCond, br->getSuccessor(0), br->getSuccessor(1));
+        // BranchInst *newBr = Builder.CreateCondBr(newBrCond, br->getSuccessor(0), br->getSuccessor(1));
+
+        Value *maskAllTrue = Builder.CreateAndReduce(BlockMasks[BB]);
+        Value *finalCond = Builder.CreateAnd(newBrCond, maskAllTrue);
+        br->setCondition(finalCond);
+        // markedForDeletion.insert(br);
       } else {
+        Value *newMask = Builder.CreateAnd(BlockMasks[BB], condInst);
+        cast<PHINode>(BlockMasks[br->getSuccessor(0)])->addIncoming(newMask, BB);
+        Value *newBrCond = Builder.CreateOrReduce(newMask);
+        br->setCondition(newBrCond);
       }
 
 
-      markedForDeletion.insert(br);
     } else {
+      Builder.SetInsertPoint(condInst->getNextNode());
+      Value *inv = Builder.CreateNot(condInst);
+      cast<PHINode>(BlockMasks[br->getSuccessor(0)])->addIncoming(condInst, BB);
+      cast<PHINode>(BlockMasks[br->getSuccessor(1)])->addIncoming(inv, BB);
       branchInsts.insert(br);
     }
   }
@@ -775,7 +785,7 @@ void EnforceVectorizationImpl::transformIdLoads() {
 
   // initialize masks with blank PHI nodes
   for (BasicBlock &BB : *F) {
-    Builder.SetInsertPoint(&BB);
+    Builder.SetInsertPoint(BB.getFirstInsertionPt());
     unsigned numPreds = std::distance(pred_begin(&BB), pred_end(&BB));
     if (numPreds == 0) {
       BlockMasks[&BB] = createConstantMask(Builder, GangSize);
@@ -878,7 +888,6 @@ void EnforceVectorizationImpl::transformIdLoads() {
     BasicBlock *BB = worklist.front();
     worklist.pop_front();
     bool changed = false;
-    llvm::errs() << BB->getName() << ":\n";
 
     IRBuilder<> Builder(&*BB->begin());
     PHINode *phi = dyn_cast<PHINode>(BlockMasks[BB]);
@@ -893,21 +902,20 @@ void EnforceVectorizationImpl::transformIdLoads() {
 
     for (BasicBlock *Pred : predecessors(BB)) {
       Value *Incoming = nullptr;
-      auto It = BlockMaskPredecessors[BB].find(Pred);
-      if (It != BlockMaskPredecessors[BB].end() && It->second != nullptr) {
-        Incoming = It->second;
-      } else {
-        for (Loop *L = LI.getLoopFor(Pred); L; L = L->getParentLoop()) {
-          if (L->isLoopExiting(Pred) && !L->contains(BB) && LoopMasks[L]) {
-            Incoming = LoopMasks[L];
-            break;
-          }
+      for (Loop *L = LI.getLoopFor(Pred); L; L = L->getParentLoop()) {
+        if (L->isLoopExiting(Pred) && !L->contains(BB) && LoopMasks[L]) {
+          Incoming = LoopMasks[L];
+          break;
         }
-        if (!Incoming)
-          Incoming = BlockMasks[Pred];
+      }
+      if (Incoming) {
+        changed |= updatePHI(phi, Pred, Incoming);
       }
 
-      changed |= updatePHI(phi, Pred, Incoming);
+      if (phi->getBasicBlockIndex(Pred) >= 0) {
+        continue;
+      }
+      changed |= updatePHI(phi, Pred, BlockMasks[Pred]);
     }
 
     // Handle loop mask. At the exit of the loop, the mask should reset to the
@@ -931,25 +939,13 @@ void EnforceVectorizationImpl::transformIdLoads() {
         }
       }
     }
-    BlockMasks[BB] = phi;
+    // BlockMasks[BB] = phi;
 
     if (changed) {
       for (BasicBlock *succ : successors(BB)) {
         worklist.push_back(succ);
       }
     }
-  }
-
-  // Given a conditional predicate mask (constructed earlier), we need to exit the loop if either the
-  // predicate mask is all zeroes (already check by initial condition), or the previous predicate mask (current loop mask)
-  // contains any number of zeroes.
-  for (BasicBlock *BB : loopBranches) {
-    BranchInst *br = cast<BranchInst>(BB->getTerminator());
-    Value *cond = br->getCondition();
-    Builder.SetInsertPoint(br);
-    Value *maskAllTrue = Builder.CreateAndReduce(BlockMasks[BB]);
-    Value *newCond = Builder.CreateAnd(cond, maskAllTrue);
-    br->setCondition(newCond);
   }
 
   // After setting up all the masks with the phi, we need to merge branches into
