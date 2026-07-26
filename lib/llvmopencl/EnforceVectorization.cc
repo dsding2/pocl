@@ -167,6 +167,8 @@ private:
   void transformIdStores(BasicBlock *BB);
   void transformForInc(BasicBlock *BB);
   void transformIdLoads();
+  void generateMasks();
+  void transformControlFlow();
   Instruction *findIncrementOfGlobal(BasicBlock *BB, GlobalVariable *GV);
   void findLoadsOfGlobal(GlobalVariable *GV, std::vector<Instruction *> &Loads);
 
@@ -219,6 +221,8 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   Changed |= fixUndominatedVariableUses(DT, Func);
 
   Changed |= privatizeContext();
+
+  M->dump();
 
   return Changed;
 }
@@ -337,11 +341,8 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
 
     if (loopBranches.count(br->getParent()) > 0) {
       Builder.SetInsertPoint(br);
-      // For loop predicates, any false means that all future mask values must
+      // For loop predicates in the pregion_for_cond blocks, any false means that all future mask values must
       // also be false.
-      // TODO: change this to only apply to branches in the for_cond blocks.
-      // For other blocks, you must set it up such that if a mask value is
-      // false, it will be false forever.
       if (blockHasTag(br->getParent(), "pregion_for_cond")) {
         Value *newLoopPredicate =
             constructLoopPredicatePrefix(Builder, condInst);
@@ -380,24 +381,7 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
 
   std::vector<Value *> newOperands;
 
-  // We need to insert all new instructions after the transformations of all of
-  // their operands. Thus, find the latest operand.
   Instruction *insertPoint = I->getNextNode();
-  // for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-  //   auto *operandInst = dyn_cast<Instruction>(I->getOperand(i));
-  //   if (!operandInst || !InstGraph.count(operandInst))
-  //     continue;
-
-  //   Instruction *candidate =
-  //       !HAS_VALUE_OUTPUT(InstGraph[operandInst])
-  //           ? candidate = InstGraph[operandInst].arrayOutput.back()
-  //           : candidate = InstGraph[operandInst].valueOutput;
-
-  //   if (candidate && latestOperand->getParent() == candidate->getParent() &&
-  //       latestOperand->comesBefore(candidate)) {
-  //     latestOperand = candidate;
-  //   }
-  // }
   llvm::IRBuilder<> Builder(insertPoint);
 
   for (unsigned i = 0; i < I->getNumOperands(); ++i) {
@@ -750,7 +734,8 @@ void EnforceVectorizationImpl::transformIdLoads() {
     Builder.SetInsertPoint(BB.getFirstInsertionPt());
     unsigned numPreds = std::distance(pred_begin(&BB), pred_end(&BB));
     if (numPreds == 0) {
-      BlockMasks[&BB] = createConstantMask(Builder, GangSize);
+      // If WGLocalSizeX >= GangSize, then the mask is all ones, otherwise [0..WGLocalSizeX] = 1
+      BlockMasks[&BB] = createConstantMask(Builder, WGLocalSizeX);
     } else {
       BlockMasks[&BB] = Builder.CreatePHI(
           VectorType::get(Builder.getInt1Ty(), GangSize, false), numPreds);
@@ -797,9 +782,6 @@ void EnforceVectorizationImpl::transformIdLoads() {
     }
   }
 
-  // Masking is handled in two stages. The first stage happens during the
-  // recursive vectorizeInstruction, which figures out the masks for conditional
-  // branches, and sets up needed information for CFG loops.
   for (Instruction *I : TopoOrder) {
     // Don't try to vectorize the initial loads from the global/local IDs.
     if (AllVectorizableLoads.count(I) == 0) {
@@ -807,13 +789,15 @@ void EnforceVectorizationImpl::transformIdLoads() {
     }
   }
 
-  llvm::SmallVector<llvm::Instruction *> deletion_vec(markedForDeletion.begin(),
-                                                      markedForDeletion.end());
-  for (int i = 0; i < deletion_vec.size(); i++) {
-    Instruction *inst = deletion_vec[i];
+  // TODO: is this redundant with eraseUsersRecursively?
+  for (Instruction *inst : markedForDeletion) {
     inst->replaceAllUsesWith(PoisonValue::get(inst->getType()));
     inst->eraseFromParent();
   }
+}
+
+void EnforceVectorizationImpl::generateMasks() {
+  IRBuilder<> Builder(M->getContext());
 
   // This is the second stage, which traverses the blocks in approximate order,
   // and fills out the masking. Generally, just use a phi node set to inherit
@@ -836,19 +820,16 @@ void EnforceVectorizationImpl::transformIdLoads() {
     return true;
   };
 
-  // TODO: Right now, we take all enabled as default. This breaks if GangSize <
-  // GlobalSize, and maybe some other edge cases
   Builder.SetInsertPoint(F->getEntryBlock().begin());
-  // BlockMasks[&F->getEntryBlock()] = createConstantMask(Builder, GangSize);
 
-  std::deque<BasicBlock *> worklist;
+  std::deque<BasicBlock *> Worklist;
   for (BasicBlock *BB : successors(&F->getEntryBlock())) {
-    worklist.push_back(BB);
+    Worklist.push_back(BB);
   }
 
-  while (!worklist.empty()) {
-    BasicBlock *BB = worklist.front();
-    worklist.pop_front();
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.front();
+    Worklist.pop_front();
     bool changed = false;
 
     IRBuilder<> Builder(&*BB->begin());
@@ -898,7 +879,7 @@ void EnforceVectorizationImpl::transformIdLoads() {
         Builder.Insert(phiClone);
         changed = true;
         for (BasicBlock *LoopBB : L->getBlocks()) {
-          worklist.push_back(LoopBB);
+          Worklist.push_back(LoopBB);
         }
       }
     }
@@ -906,15 +887,18 @@ void EnforceVectorizationImpl::transformIdLoads() {
 
     if (changed) {
       for (BasicBlock *succ : successors(BB)) {
-        worklist.push_back(succ);
+        Worklist.push_back(succ);
       }
     }
   }
+}
+
+void EnforceVectorizationImpl::transformControlFlow() {
+  IRBuilder<> Builder(M->getContext());
 
   // After setting up all the masks with the phi, we need to merge branches into
   // a single straight line path.
 
-  // TODO: This breaks down if you have nested control flow.
   for (BranchInst *br : branchInsts) {
     BasicBlock *trueBB = br->getSuccessor(0);
     BasicBlock *falseBB = br->getSuccessor(1);
@@ -946,7 +930,12 @@ void EnforceVectorizationImpl::transformIdLoads() {
     // Then, we set up the true branch by rerouting the merge block predecessor
     // terminators to the beginning of the false branch. Then, we set the masks
     // for the false branch.
-    // TODO: what if there are no blocks in the true branch?
+
+    // If the true branch has no blocks, then the branch block should point directly to the falsePhiNodes instead
+    if (trueBBMergePreds.empty()) {
+      trueBBMergePreds.insert(br->getParent());
+      trueBB = falseBB;
+    }
     PHINode *MergeMask = cast<PHINode>(BlockMasks[mergeBB]);
     for (BasicBlock *trueBBMergePred : trueBBMergePreds) {
       BranchInst *mergePredBr =
@@ -1057,6 +1046,8 @@ bool EnforceVectorizationImpl::processFunction(Function &F) {
   }
 
   transformIdLoads();
+  generateMasks();
+  transformControlFlow();
 
   eraseUsersRecursively(GlobalIdIterators[VectorizationDim]);
   eraseUsersRecursively(LocalIdIterators[VectorizationDim]);
