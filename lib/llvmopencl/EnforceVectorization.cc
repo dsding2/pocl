@@ -99,10 +99,7 @@ private:
   struct GraphNode {
     llvm::Instruction *valueOutput = nullptr;
     std::vector<llvm::Instruction *> arrayOutput;
-    std::unordered_set<llvm::Instruction *> children;
-
-    // Used for Kahn's algorithm to generate a topological sort
-    int in_degree = 0;
+    std::vector<llvm::Instruction *> children;
   };
 
   using BasicBlockVector = std::vector<llvm::BasicBlock *>;
@@ -183,7 +180,10 @@ private:
 };
 
 bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
+  // return false;
   M = Func.getParent();
+  M->dump();
+
   F = &Func;
   Initialize(cast<Kernel>(&Func));
 
@@ -282,8 +282,7 @@ void EnforceVectorizationImpl::traverseInstructionTree(
   for (User *U : I->users()) {
     Instruction *ChildInst = dyn_cast<Instruction>(U);
     if (ChildInst) {
-      InstGraph[ChildInst].in_degree += 1;
-      InstGraph[I].children.insert(ChildInst);
+      InstGraph[I].children.push_back(ChildInst);
       if (visited.count(ChildInst) == 0) {
         traverseInstructionTree(ChildInst, visited);
       }
@@ -292,8 +291,6 @@ void EnforceVectorizationImpl::traverseInstructionTree(
 }
 
 void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
-  // InstGraph[I].mask = InstGraph[oldVal].mask;
-
   // Handle branches
   if (BranchInst *br = dyn_cast<BranchInst>(I)) {
     branchReplace(br);
@@ -371,108 +368,161 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
   }
 }
 
-#define SPLAT_OPERAND(idx)                                                     \
-  if (!newOperands[idx]->getType()->isVectorTy()) {                            \
-    newOperands[idx] = Builder.CreateVectorSplat(GangSize, newOperands[idx]);  \
-  }
-// assumes the opcode is vectorizable, and that the operands are either vectors
-// or vectorizable returns new instruction
-void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
 
+// Assumes the opcode is vectorizable and that operands are either vectors
+// or can be vectorized. Creates and records the vectorized replacement.
+void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
   std::vector<Value *> newOperands;
+  newOperands.reserve(I->getNumOperands());
 
   Instruction *insertPoint = I->getNextNode();
-  llvm::IRBuilder<> Builder(insertPoint);
+  IRBuilder<> Builder(insertPoint);
 
+  // Convert operands to their vectorized value outputs when necessary.
   for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-    Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(i));
-    if (operandInst && InstGraph.count(operandInst) > 0) {
-      // convert arrayOutput to valueOutput
-      if (!HAS_VALUE_OUTPUT(InstGraph[operandInst])) {
-        std::vector<Instruction *> &oldValOutputs =
-            InstGraph[operandInst].arrayOutput;
-        Type *elemTy = oldValOutputs[0]->getType();
-        VectorType *vecTy = VectorType::get(elemTy, GangSize, false);
-        Value *vec = UndefValue::get(vecTy);
+    Value *operand = I->getOperand(i);
+
+    if (auto *operandInst = dyn_cast<Instruction>(operand);
+        operandInst && InstGraph.count(operandInst)) {
+      auto &operandGraph = InstGraph[operandInst];
+
+      // Convert arrayOutput -> valueOutput.
+      if (!HAS_VALUE_OUTPUT(operandGraph)) {
+        auto &oldValOutputs = operandGraph.arrayOutput;
+
+        Type *elementType = oldValOutputs.front()->getType();
+        VectorType *vectorType =
+            VectorType::get(elementType, GangSize, false);
+
+        Value *vector = UndefValue::get(vectorType);
+
         Builder.SetInsertPoint(oldValOutputs.back()->getNextNode());
-        for (unsigned i = 0; i < GangSize; i++) {
-          vec = Builder.CreateInsertElement(vec, oldValOutputs[i],
-                                            Builder.getInt32(i));
+
+        for (unsigned lane = 0; lane < GangSize; ++lane) {
+          vector = Builder.CreateInsertElement(
+              vector, oldValOutputs[lane], Builder.getInt32(lane));
         }
+
+        operandGraph.valueOutput = cast<Instruction>(vector);
         Builder.SetInsertPoint(insertPoint);
-        InstGraph[operandInst].valueOutput = cast<Instruction>(vec);
       }
-      newOperands.push_back(InstGraph[operandInst].valueOutput);
+
+      newOperands.push_back(operandGraph.valueOutput);
     } else {
-      newOperands.push_back(I->getOperand(i));
+      newOperands.push_back(operand);
     }
   }
 
-  llvm::Instruction *newInst = nullptr;
+  // Convert an operand to a vector by splatting it when necessary.
+  auto splat = [&](unsigned index) -> Value * {
+    Value *&operand = newOperands[index];
+    if (!operand->getType()->isVectorTy()) {
+      operand = Builder.CreateVectorSplat(GangSize, operand);
+    }
+    return operand;
+  };
+
+  auto vectorizedType = [&]() -> VectorType * {
+    return VectorType::get(I->getType(), GangSize, false);
+  };
+
+  Instruction *newInst = nullptr;
+
   if (I->getOpcode() == Instruction::Call) {
-    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
-      if (II->getIntrinsicID() == Intrinsic::fmuladd) {
-        VectorType *vectorizedType =
-            VectorType::get(I->getType(), GangSize, false);
-        SPLAT_OPERAND(0);
-        SPLAT_OPERAND(1);
-        SPLAT_OPERAND(2);
-        auto newCallInst = Builder.CreateIntrinsic(
-            Intrinsic::fma, vectorizedType,
-            {newOperands[0], newOperands[1], newOperands[2]});
-        newInst = cast<Instruction>(newCallInst);
-      }
+    auto *intrinsic = dyn_cast<IntrinsicInst>(I);
+
+    if (intrinsic &&
+        intrinsic->getIntrinsicID() == Intrinsic::fmuladd) {
+      splat(0);
+      splat(1);
+      splat(2);
+
+      newInst = cast<Instruction>(Builder.CreateIntrinsic(
+          Intrinsic::fma,
+          vectorizedType(),
+          {newOperands[0], newOperands[1], newOperands[2]}));
     }
   } else if (I->getOpcode() == Instruction::GetElementPtr) {
-    // Again, I can't figure out the correct semantics for GEP, so it's disabled
-    // for now
-    // assert(false);
-    auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(I);
-    
-    // VectorType *vectorizedType = VectorType::get(I->getType(), GangSize, false);
-    SPLAT_OPERAND(0);
+    auto *GEP = cast<GetElementPtrInst>(I);
 
-    llvm::SmallVector<Value *> tail(newOperands.begin() + 1, newOperands.end());
-    newInst = cast<Instruction>(
-        Builder.CreateGEP(GEP->getSourceElementType(), newOperands[0], tail, "", GEP->isInBounds()));
+    splat(0);
+
+    SmallVector<Value *> indices(
+        newOperands.begin() + 1, newOperands.end());
+
+    newInst = cast<Instruction>(Builder.CreateGEP(
+        GEP->getSourceElementType(),
+        newOperands[0],
+        indices,
+        "",
+        GEP->isInBounds()));
   } else if (I->getOpcode() == Instruction::Load) {
-    VectorType *vectorizedType = VectorType::get(I->getType(), GangSize, false);
-    SPLAT_OPERAND(0);
-    auto newCallInst =
-        Builder.CreateMaskedGather(vectorizedType, newOperands[0], Align(4),
-                                   NULL, PoisonValue::get(vectorizedType));
-    maskedCalls.insert(std::make_pair(newCallInst, 2));
-    newInst = cast<Instruction>(newCallInst);
+    splat(0);
+
+    auto *load = cast<LoadInst>(I);
+    auto *newLoad = Builder.CreateMaskedGather(
+        vectorizedType(),
+        newOperands[0],
+        load->getAlign(),
+        nullptr,
+        PoisonValue::get(vectorizedType()));
+
+    maskedCalls.insert({newLoad, 2});
+    newInst = newLoad;
   } else if (I->getOpcode() == Instruction::Store) {
-    SPLAT_OPERAND(0);
-    SPLAT_OPERAND(1);
-    auto newCallInst = Builder.CreateMaskedScatter(
-        newOperands[0], newOperands[1], Align(4), NULL);
-    maskedCalls.insert(std::make_pair(newCallInst, 3));
-    newInst = cast<Instruction>(newCallInst);
-  } else if (isa<CmpInst>(I)) {
-    SPLAT_OPERAND(0);
-    SPLAT_OPERAND(1);
-    CmpInst *ICMP = cast<CmpInst>(I);
-    newInst = cast<Instruction>(Builder.CreateICmp(
-        ICMP->getPredicate(), newOperands[0], newOperands[1]));
+    splat(0);
+    splat(1);
+
+    auto *store = cast<StoreInst>(I);
+
+    auto *newStore = Builder.CreateMaskedScatter(
+        newOperands[0],
+        newOperands[1],
+        store->getAlign(),
+        nullptr);
+
+    maskedCalls.insert({newStore, 3});
+    newInst = newStore;
+  } else if (I->getOpcode() == Instruction::Select) {
+    splat(0);
+    splat(1);
+    splat(2);
+
+    newInst = cast<Instruction>(Builder.CreateSelect(
+        newOperands[0],
+        newOperands[1],
+        newOperands[2]));
+  } else if (auto *cmp = dyn_cast<CmpInst>(I)) {
+    splat(0);
+    splat(1);
+
+    newInst = cast<Instruction>(Builder.CreateCmp(
+        cmp->getPredicate(),
+        newOperands[0],
+        newOperands[1]));
   } else if (Instruction::isBinaryOp(I->getOpcode())) {
-    SPLAT_OPERAND(0);
-    SPLAT_OPERAND(1);
-    newInst = cast<Instruction>(
-        Builder.CreateBinOp((llvm::Instruction::BinaryOps)I->getOpcode(),
-                            newOperands[0], newOperands[1]));
+    splat(0);
+    splat(1);
+
+    newInst = cast<Instruction>(Builder.CreateBinOp(
+        static_cast<Instruction::BinaryOps>(I->getOpcode()),
+        newOperands[0],
+        newOperands[1]));
   } else if (Instruction::isUnaryOp(I->getOpcode())) {
-    SPLAT_OPERAND(0);
+    splat(0);
+
     newInst = cast<Instruction>(Builder.CreateUnOp(
-        (llvm::Instruction::UnaryOps)I->getOpcode(), newOperands[0]));
+        static_cast<Instruction::UnaryOps>(I->getOpcode()),
+        newOperands[0]));
   } else if (Instruction::isCast(I->getOpcode())) {
-    SPLAT_OPERAND(0);
-    newInst = cast<Instruction>(
-        Builder.CreateCast((llvm::Instruction::CastOps)I->getOpcode(),
-                           newOperands[0], I->getType()));
+    splat(0);
+
+    newInst = cast<Instruction>(Builder.CreateCast(
+        static_cast<Instruction::CastOps>(I->getOpcode()),
+        newOperands[0],
+        vectorizedType()));
   } else {
-    assert(false);
+    llvm_unreachable("Unsupported opcode in vectorizedReplace");
   }
 
   markedForDeletion.insert(I);
@@ -537,10 +587,12 @@ bool EnforceVectorizationImpl::isVectorizableInstruction(Instruction *I) {
   case Instruction::AShr:
   case Instruction::LShr:
   case Instruction::ICmp:
+  case Instruction::FCmp:
   case Instruction::Load:
   case Instruction::Store:
-    // In theory, there should be a vectorized version of GEP, but I can't
-    // figure out the semantics
+  case Instruction::Trunc:
+  case Instruction::Select:
+  case Instruction::FNeg:
   case Instruction::GetElementPtr:
     break;
   case Instruction::Call:
@@ -555,10 +607,12 @@ bool EnforceVectorizationImpl::isVectorizableInstruction(Instruction *I) {
 
   for (Value *Op : I->operands()) {
     Type *OpType = Op->getType();
-    if (!OpType->isIntegerTy() && !OpType->isFloatingPointTy() &&
-        !OpType->isVectorTy() && !OpType->isPointerTy()) {
+    if (!OpType->isIntegerTy() && !OpType->isFloatingPointTy() && !OpType->isPointerTy()) {
       return false;
     }
+  }
+  if (I->getType()->isVectorTy()) {
+    return false;
   }
   return true;
 }
@@ -668,15 +722,6 @@ void EnforceVectorizationImpl::transformForInc(BasicBlock *BB) {
                           StepVec),
         VectorizedGlobalIdVar);
   }
-
-  // Generate new mask
-  if (LocalIteratorInc) {
-    // Value *sequential = makeSequentialVector();
-    // Value *trailing = Builder.CreateSub(Builder.getInt32(WGLocalSizeX),
-    // LocalIteratorInc); Value *trailingSplat =
-    // Builder.CreateVectorSplat(GangSize, trailing); Value *mask =
-    // Builder.CreateICmpULT(sequential, trailingSplat);
-  }
 }
 
 void EnforceVectorizationImpl::findLoadsOfGlobal(
@@ -766,6 +811,18 @@ void EnforceVectorizationImpl::transformIdLoads() {
     traverseInstructionTree(LoadInst, visited);
   }
 
+  DenseMap<Instruction *, int> in_degree;
+  for (Instruction *I : visited)
+    in_degree[I] = 0;
+
+  for (Instruction *I : visited) {
+    for (User *U : I->users()) {
+      Instruction *UI = dyn_cast<Instruction>(U);
+      if (UI && visited.count(UI) > 0)
+          in_degree[UI]++;
+    }
+  }
+
   // Topological sort
   SmallVector<Instruction *> Worklist;
   for (auto &LoadInst : AllVectorizableLoads) {
@@ -776,7 +833,7 @@ void EnforceVectorizationImpl::transformIdLoads() {
     Instruction *I = Worklist.pop_back_val();
     TopoOrder.push_back(I);
     for (Instruction *User : InstGraph[I].children) {
-      if (--(InstGraph[User].in_degree) == 0) {
+      if (--(in_degree[User]) == 0) {
         Worklist.push_back(User);
       }
     }
