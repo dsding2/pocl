@@ -21,8 +21,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 // IN THE SOFTWARE.
 
-#ifndef POCL_ENFORCE_VECTORIZATION_H
-#define POCL_ENFORCE_VECTORIZATION_H
+#ifndef POCL_WHOLE_FUNCTION_VECTORIZATION_H
+#define POCL_WHOLE_FUNCTION_VECTORIZATION_H
 
 #include "config.h"
 
@@ -34,7 +34,7 @@
 namespace pocl {
 
 
-class EnforceVectorization : public llvm::PassInfoMixin<EnforceVectorization> {
+class WholeFunctionVectorization : public llvm::PassInfoMixin<WholeFunctionVectorization> {
 public:
   static void registerWithPB(llvm::PassBuilder &B);
   llvm::PreservedAnalyses run(llvm::Function &F,

@@ -30,8 +30,8 @@ unset(CMAKE_CXX_STANDARD)
 unset(CMAKE_CXX_STANDARD_REQUIRED)
 
 set(LLVMPASSES_SOURCES 
-                       "EnforceVectorization.cc"
-                       "EnforceVectorization.h"
+                       "WholeFunctionVectorization.cc"
+                       "WholeFunctionVectorization.h"
                        "AllocasToEntry.cc"
                        "AllocasToEntry.h"
                        "AutomaticLocals.cc"

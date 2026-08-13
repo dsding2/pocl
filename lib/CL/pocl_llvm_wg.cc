@@ -596,7 +596,7 @@ static void addStage2PassesToPipeline(cl_device_id Dev,
   // be to add hidden context struct parameters to the builtins that need the
   // context data and fix the calls early.
   if (Dev->run_workgroup_pass) {
-    addPass(Passes, "enforce-vectorization");
+    addPass(Passes, "whole-function-vectorization");
     addPass(Passes, "adce");
     addPass(Passes, "workgroup", PassType::Module);
     addPass(Passes, "always-inline", PassType::Module);
