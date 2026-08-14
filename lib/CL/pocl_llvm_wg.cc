@@ -74,6 +74,8 @@ POP_COMPILER_DIAGS
 #include "pocl_llvm_api.h"
 #include "pocl_spir.h"
 #include "pocl_util.h"
+#include "pocl_runtime_config.h"
+
 
 #include <iostream>
 #include <map>
@@ -596,8 +598,10 @@ static void addStage2PassesToPipeline(cl_device_id Dev,
   // be to add hidden context struct parameters to the builtins that need the
   // context data and fix the calls early.
   if (Dev->run_workgroup_pass) {
-    addPass(Passes, "whole-function-vectorization");
-    addPass(Passes, "adce");
+    if (pocl_get_bool_option("POCL_ENABLE_WFV", false)) {
+      addPass(Passes, "whole-function-vectorization");
+      addPass(Passes, "adce");
+    }
     addPass(Passes, "workgroup", PassType::Module);
     addPass(Passes, "always-inline", PassType::Module);
   }
