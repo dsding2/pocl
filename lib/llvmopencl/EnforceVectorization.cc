@@ -103,9 +103,6 @@ private:
 
     // Used for Kahn's algorithm to generate a topological sort
     int in_degree = 0;
-
-    // Determines whether loads should be converted to wide loads or gathers
-    bool isContiguous = true;
   };
 
   using BasicBlockVector = std::vector<llvm::BasicBlock *>;
@@ -167,7 +164,6 @@ private:
 
   Instruction *ConvertOpToMaskedIntrinsic(IRBuilder<> &Builder, Instruction *I,
                                           Value *op1, Value *op2);
-  bool checkContiguous(llvm::Instruction *I);
   void vectorizeInstruction(llvm::Instruction *I);
   void wideLoadReplace(llvm::Instruction *I);
   void branchReplace(llvm::BranchInst *I);
@@ -315,80 +311,17 @@ void EnforceVectorizationImpl::traverseInstructionTree(
   }
 }
 
-bool EnforceVectorizationImpl::checkContiguous(Instruction *I) {
-  auto IOpcode = I->getOpcode();
-
-  bool checkContiguous = true;
-  for (int idx = 0; idx < I->getNumOperands(); idx++) {
-    auto operandInst = dyn_cast<Instruction>(I->getOperand(idx));
-    if (!operandInst || InstGraph.count(operandInst) == 0 ||
-        InstGraph[operandInst].isContiguous) {
-      // pass
-    } else {
-      checkContiguous = false;
-    }
-  }
-
-  if (!checkContiguous) {
-    return false;
-  }
-  if (IOpcode == Instruction::Add || IOpcode == Instruction::Sub ||
-      IOpcode == Instruction::GetElementPtr) {
-    return true;
-  }
-
-  Instruction *Grandparent;
-  const APInt *Shift;
-  if (PatternMatch::match(
-          I, PatternMatch::m_AShr(
-                 PatternMatch::m_Shl(PatternMatch::m_Instruction(Grandparent),
-                                     PatternMatch::m_APInt(Shift)),
-                 PatternMatch::m_APInt(Shift)))) {
-    return InstGraph[Grandparent].isContiguous;
-  }
-  return false;
-}
-
 void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
   // InstGraph[I].mask = InstGraph[oldVal].mask;
-  InstGraph[I].isContiguous = checkContiguous(I);
 
   // Handle branches
   if (BranchInst *br = dyn_cast<BranchInst>(I)) {
     branchReplace(br);
-  } else if (InstGraph[I].isContiguous &&
-             (I->getOpcode() == Instruction::Load)) {
-    wideLoadReplace(I);
   } else if (isVectorizableInstruction(I)) {
     vectorizedReplace(I);
   } else {
     unvectorizedReplace(I);
   }
-}
-
-void EnforceVectorizationImpl::wideLoadReplace(llvm::Instruction *I) {
-  IRBuilder<> Builder(I);
-  Value *newPtr;
-
-  Instruction *operandInst = dyn_cast<Instruction>(I->getOperand(0));
-  if (operandInst && InstGraph.count(operandInst) > 0) {
-    std::vector<Instruction *> unpackedOperand;
-    if (!HAS_ARRAY_OUTPUT(InstGraph[operandInst])) {
-      Builder.SetInsertPoint(InstGraph[operandInst].valueOutput->getNextNode());
-
-      newPtr = Builder.CreateExtractElement(InstGraph[operandInst].valueOutput,
-                                            (int)0);
-    }
-  } else {
-    newPtr = I->getOperand(0);
-  }
-
-  VectorType *vectorizedType = VectorType::get(I->getType(), GangSize, false);
-  Instruction *res =
-      cast<Instruction>(Builder.CreateLoad(vectorizedType, newPtr));
-
-  markedForDeletion.insert(I);
-  InstGraph[I].valueOutput = res;
 }
 
 bool EnforceVectorizationImpl::blockHasTag(const BasicBlock *BB,
