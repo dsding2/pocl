@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "config.h"
 #include "common.h"
@@ -483,6 +484,10 @@ build_program_compute_hash (cl_program program, unsigned device_i,
     if (program->compiler_options)
         pocl_SHA1_Update(&hash_ctx, (uint8_t*) program->compiler_options,
                          strlen(program->compiler_options));
+    
+    u_int8_t compile_with_wfv = pocl_get_bool_option("POCL_ENABLE_WFV", false);
+    pocl_SHA1_Update(&hash_ctx, (uint8_t*) &compile_with_wfv, 1);
+    
 
     pocl_SHA1_Update (&hash_ctx,
                       (uint8_t *)&program->binary_type,
