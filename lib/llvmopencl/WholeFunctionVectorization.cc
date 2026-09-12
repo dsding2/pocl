@@ -55,6 +55,7 @@ IGNORE_COMPILER_WARNING("-Wunused-parameter")
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/IR/InstIterator.h>
 
 #include "WholeFunctionVectorization.h"
 #include "Kernel.h"
@@ -136,7 +137,7 @@ private:
   std::map<llvm::Loop *, llvm::Value *> LoopMasks;
 
   // Store all created calls that require a mask.
-  std::set<std::pair<llvm::CallInst *, int>> maskedCalls;
+  std::map<llvm::CallInst *, int> maskedCalls;
 
   std::unordered_set<llvm::BranchInst *> branchInsts;
 
@@ -166,6 +167,7 @@ private:
   void transformIdLoads();
   void generateMasks();
   void transformControlFlow();
+  void applyMasks();
   Instruction *findIncrementOfGlobal(BasicBlock *BB, GlobalVariable *GV);
   void findLoadsOfGlobal(GlobalVariable *GV, std::vector<Instruction *> &Loads);
 
@@ -180,9 +182,7 @@ private:
 };
 
 bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
-  // return false;
   M = Func.getParent();
-  M->dump();
 
   F = &Func;
   Initialize(cast<Kernel>(&Func));
@@ -221,8 +221,6 @@ bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
   Changed |= fixUndominatedVariableUses(DT, Func);
 
   Changed |= privatizeContext();
-
-  M->dump();
 
   return Changed;
 }
@@ -295,8 +293,9 @@ void WholeFunctionVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) 
   if (BranchInst *br = dyn_cast<BranchInst>(I)) {
     branchReplace(br);
   } else if (isVectorizableInstruction(I)) {
-    vectorizedReplace(I);
+      vectorizedReplace(I);
   } else {
+    I->dump();
     unvectorizedReplace(I);
   }
 }
@@ -431,16 +430,15 @@ void WholeFunctionVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
   if (I->getOpcode() == Instruction::Call) {
     auto *intrinsic = dyn_cast<IntrinsicInst>(I);
 
-    if (intrinsic &&
-        intrinsic->getIntrinsicID() == Intrinsic::fmuladd) {
-      splat(0);
-      splat(1);
-      splat(2);
+    if (intrinsic) {
+      for (int i = 0; i < newOperands.size()-1; i++) {
+        splat(i);
+      }
 
       newInst = cast<Instruction>(Builder.CreateIntrinsic(
-          Intrinsic::fma,
+          intrinsic->getIntrinsicID(),
           vectorizedType(),
-          {newOperands[0], newOperands[1], newOperands[2]}));
+          llvm::ArrayRef<llvm::Value *>(newOperands).drop_back()));
     }
   } else if (I->getOpcode() == Instruction::GetElementPtr) {
     auto *GEP = cast<GetElementPtrInst>(I);
@@ -467,7 +465,7 @@ void WholeFunctionVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
         nullptr,
         PoisonValue::get(vectorizedType()));
 
-    maskedCalls.insert({newLoad, 2});
+    maskedCalls[newLoad] = 2;
     newInst = newLoad;
   } else if (I->getOpcode() == Instruction::Store) {
     splat(0);
@@ -481,7 +479,7 @@ void WholeFunctionVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
         store->getAlign(),
         nullptr);
 
-    maskedCalls.insert({newStore, 3});
+    maskedCalls[newStore] = 3;
     newInst = newStore;
   } else if (I->getOpcode() == Instruction::Select) {
     splat(0);
@@ -594,10 +592,13 @@ bool WholeFunctionVectorizationImpl::isVectorizableInstruction(Instruction *I) {
   case Instruction::Select:
   case Instruction::FNeg:
   case Instruction::GetElementPtr:
+  case Instruction::SExt:
+  case Instruction::ZExt:
     break;
   case Instruction::Call:
     if (auto *II = dyn_cast<IntrinsicInst>(I)) {
-      if (II->getIntrinsicID() == Intrinsic::fmuladd) {
+      if (II->getIntrinsicID() == Intrinsic::fmuladd ||
+          II->getIntrinsicID() == Intrinsic::sqrt) {
         break;
       }
     }
@@ -1027,6 +1028,50 @@ void WholeFunctionVectorizationImpl::transformControlFlow() {
     br->eraseFromParent();
   }
 
+
+}
+
+void WholeFunctionVectorizationImpl::applyMasks() {
+  // Force mask all stores
+  llvm::SmallVector<Instruction *> queue;
+  for (Instruction &I : instructions(F)) {
+    queue.push_back(&I);
+  }
+
+  for (Instruction *I : queue) {
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      BasicBlock *BB = SI->getParent();
+      if (auto *M = BB->getTerminator()->getMetadata("myrole")) {
+        auto *S = dyn_cast<MDString>(M->getOperand(0));
+        if (S && (S->getString() == "pregion_for_inc" ||
+                  S->getString() == "pregion_for_init")) {
+          continue;
+        }
+      }
+
+      if (SI->getParent()->getName() == "entry.barrier") {
+        continue;
+      }
+
+      IRBuilder<> Builder(SI);
+
+      // Reduce <8 x i1> -> i1
+      Value *AnyMask = Builder.CreateOrReduce(BlockMasks[BB]);
+      Instruction *ThenTerm = SplitBlockAndInsertIfThen(AnyMask, SI, false);
+
+      BasicBlock *StoreBB = ThenTerm->getParent();
+      
+      SI->removeFromParent();
+      Builder.SetInsertPoint(ThenTerm);
+      Builder.Insert(SI);
+
+      BlockMasks[StoreBB] = BlockMasks[BB];
+      BlockMasks[StoreBB->getNextNode()] = BlockMasks[BB];
+
+
+    }
+  }
+
   for (auto &[maskedCall, maskIdx] : maskedCalls) {
     maskedCall->setArgOperand(maskIdx, BlockMasks[maskedCall->getParent()]);
   }
@@ -1108,6 +1153,9 @@ bool WholeFunctionVectorizationImpl::processFunction(Function &F) {
 
   eraseUsersRecursively(GlobalIdIterators[VectorizationDim]);
   eraseUsersRecursively(LocalIdIterators[VectorizationDim]);
+
+  applyMasks();
+
   return true;
 }
 
