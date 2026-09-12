@@ -597,6 +597,7 @@ static void addStage2PassesToPipeline(cl_device_id Dev,
   // context data and fix the calls early.
   if (Dev->run_workgroup_pass) {
     addPass(Passes, "enforce-vectorization");
+    addPass(Passes, "adce");
     addPass(Passes, "workgroup", PassType::Module);
     addPass(Passes, "always-inline", PassType::Module);
   }
