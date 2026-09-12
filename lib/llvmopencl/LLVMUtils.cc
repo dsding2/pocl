@@ -35,7 +35,7 @@ IGNORE_COMPILER_WARNING("-Wunused-parameter")
 #include <llvm/ADT/SmallSet.h>
 
 // include all passes & analysis
-#include "EnforceVectorization.h"
+#include "WholeFunctionVectorization.h"
 #include "AllocasToEntry.h"
 #include "AutomaticLocals.h"
 #include "BarrierTailReplication.h"
@@ -657,7 +657,7 @@ const std::vector<std::string> DIFuncNameVec(DIFuncNameArray,
 // register all PoCL analyses & passes with an LLVM PassBuilder instance,
 // so that it can parse them from string representation
 void registerPassBuilderPasses(llvm::PassBuilder &PB) {
-  EnforceVectorization::registerWithPB(PB);
+  WholeFunctionVectorization::registerWithPB(PB);
   AllocasToEntry::registerWithPB(PB);
   AutomaticLocals::registerWithPB(PB);
   BarrierTailReplication::registerWithPB(PB);

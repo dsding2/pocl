@@ -56,7 +56,7 @@ IGNORE_COMPILER_WARNING("-Wunused-parameter")
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
 
-#include "EnforceVectorization.h"
+#include "WholeFunctionVectorization.h"
 #include "Kernel.h"
 #include "KernelCompilerUtils.h"
 #include "LLVMUtils.h"
@@ -72,8 +72,8 @@ POP_COMPILER_DIAGS
 
 #define DEBUG_TYPE "WIL"
 
-#define PASS_NAME "enforce-vectorization"
-#define PASS_CLASS pocl::EnforceVectorization
+#define PASS_NAME "whole-function-vectorization"
+#define PASS_CLASS pocl::WholeFunctionVectorization
 #define PASS_DESC                                                              \
   "Forces vectorization through a simple walk over the data flow graph"
 
@@ -87,9 +87,9 @@ namespace pocl {
 
 using namespace llvm;
 
-class EnforceVectorizationImpl : public pocl::WorkitemHandler {
+class WholeFunctionVectorizationImpl : public pocl::WorkitemHandler {
 public:
-  EnforceVectorizationImpl(llvm::DominatorTree &DT, llvm::LoopInfo &LI,
+  WholeFunctionVectorizationImpl(llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                            llvm::PostDominatorTree &PDT,
                            VariableUniformityAnalysisResult &VUA)
       : WorkitemHandler(), DT(DT), LI(LI), PDT(PDT), VUA(VUA) {}
@@ -179,7 +179,7 @@ private:
   bool privatizeContext();
 };
 
-bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
+bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
   // return false;
   M = Func.getParent();
   M->dump();
@@ -227,7 +227,7 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   return Changed;
 }
 
-Constant *EnforceVectorizationImpl::createConstantMask(IRBuilder<> &Builder,
+Constant *WholeFunctionVectorizationImpl::createConstantMask(IRBuilder<> &Builder,
                                                        int N) {
   Type *I1Ty = Builder.getInt1Ty();
   VectorType *MaskTy = FixedVectorType::get(I1Ty, GangSize);
@@ -244,7 +244,7 @@ Constant *EnforceVectorizationImpl::createConstantMask(IRBuilder<> &Builder,
   return ConstantVector::get(Elems);
 }
 
-void EnforceVectorizationImpl::markLoop(Loop *L) {
+void WholeFunctionVectorizationImpl::markLoop(Loop *L) {
   SmallVector<BasicBlock *, 4> exitingBlocks;
   L->getExitingBlocks(exitingBlocks);
 
@@ -267,7 +267,7 @@ void EnforceVectorizationImpl::markLoop(Loop *L) {
   loopBranches.insert(br->getParent());
 }
 
-Constant *EnforceVectorizationImpl::makeSequentialVector() {
+Constant *WholeFunctionVectorizationImpl::makeSequentialVector() {
   std::vector<Constant *> Elements;
   Elements.reserve(GangSize);
   for (unsigned i = 0; i < GangSize; i++) {
@@ -276,7 +276,7 @@ Constant *EnforceVectorizationImpl::makeSequentialVector() {
   return ConstantVector::get(Elements);
 }
 
-void EnforceVectorizationImpl::traverseInstructionTree(
+void WholeFunctionVectorizationImpl::traverseInstructionTree(
     Instruction *I, std::unordered_set<llvm::Instruction *> &visited) {
   visited.insert(I);
   for (User *U : I->users()) {
@@ -290,7 +290,7 @@ void EnforceVectorizationImpl::traverseInstructionTree(
   }
 }
 
-void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
+void WholeFunctionVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
   // Handle branches
   if (BranchInst *br = dyn_cast<BranchInst>(I)) {
     branchReplace(br);
@@ -301,14 +301,14 @@ void EnforceVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) {
   }
 }
 
-bool EnforceVectorizationImpl::blockHasTag(const BasicBlock *BB,
+bool WholeFunctionVectorizationImpl::blockHasTag(const BasicBlock *BB,
                                            StringRef Role) {
   auto *M = BB->getTerminator()->getMetadata("myrole");
   auto *S = M ? dyn_cast<MDString>(M->getOperand(0)) : nullptr;
   return S && S->getString() == Role;
 }
 
-void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
+void WholeFunctionVectorizationImpl::branchReplace(llvm::BranchInst *br) {
   if (!br->isConditional()) {
     return;
   }
@@ -371,7 +371,7 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
 
 // Assumes the opcode is vectorizable and that operands are either vectors
 // or can be vectorized. Creates and records the vectorized replacement.
-void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
+void WholeFunctionVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
   std::vector<Value *> newOperands;
   newOperands.reserve(I->getNumOperands());
 
@@ -529,7 +529,7 @@ void EnforceVectorizationImpl::vectorizedReplace(llvm::Instruction *I) {
   InstGraph[I].valueOutput = newInst;
 }
 
-void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
+void WholeFunctionVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
   Instruction *insertPoint = I->getNextNode();
   IRBuilder<> Builder(insertPoint);
 
@@ -569,7 +569,7 @@ void EnforceVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
   markedForDeletion.insert(I);
 }
 
-bool EnforceVectorizationImpl::isVectorizableInstruction(Instruction *I) {
+bool WholeFunctionVectorizationImpl::isVectorizableInstruction(Instruction *I) {
   switch (I->getOpcode()) {
   case Instruction::Add:
   case Instruction::FAdd:
@@ -617,7 +617,7 @@ bool EnforceVectorizationImpl::isVectorizableInstruction(Instruction *I) {
   return true;
 }
 
-Value *EnforceVectorizationImpl::createVectorScalarAdd(IRBuilder<> &builder,
+Value *WholeFunctionVectorizationImpl::createVectorScalarAdd(IRBuilder<> &builder,
                                                        Value *Vec,
                                                        Value *Scalar) {
   auto *VecTy = cast<VectorType>(Vec->getType());
@@ -629,7 +629,7 @@ Value *EnforceVectorizationImpl::createVectorScalarAdd(IRBuilder<> &builder,
 
 // Set up the vectorized global and local id. That is, initialize the vectors
 // as <0, 1, 2,.., GangSize-1>.
-void EnforceVectorizationImpl::transformIdStores(BasicBlock *BB) {
+void WholeFunctionVectorizationImpl::transformIdStores(BasicBlock *BB) {
   // find init of global variable (which contains the offset as an operand)
   IRBuilder<> Builder(BB);
   Builder.SetInsertPoint(BB->getFirstInsertionPt());
@@ -654,7 +654,7 @@ void EnforceVectorizationImpl::transformIdStores(BasicBlock *BB) {
 }
 
 Instruction *
-EnforceVectorizationImpl::findIncrementOfGlobal(BasicBlock *BB,
+WholeFunctionVectorizationImpl::findIncrementOfGlobal(BasicBlock *BB,
                                                 GlobalVariable *GV) {
   for (Instruction &I : *BB) {
     // Match: %x = load i64, ptr @GV
@@ -686,7 +686,7 @@ EnforceVectorizationImpl::findIncrementOfGlobal(BasicBlock *BB,
 }
 
 // Increment the iterator vector by GangSize
-void EnforceVectorizationImpl::transformForInc(BasicBlock *BB) {
+void WholeFunctionVectorizationImpl::transformForInc(BasicBlock *BB) {
   IRBuilder<> Builder(BB);
   Builder.SetInsertPoint(BB->getFirstInsertionPt());
   llvm::GlobalVariable *LocalIdVar = LocalIdIterators[VectorizationDim];
@@ -724,7 +724,7 @@ void EnforceVectorizationImpl::transformForInc(BasicBlock *BB) {
   }
 }
 
-void EnforceVectorizationImpl::findLoadsOfGlobal(
+void WholeFunctionVectorizationImpl::findLoadsOfGlobal(
     GlobalVariable *GV, std::vector<Instruction *> &Loads) {
   for (User *U : GV->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U)) {
@@ -742,7 +742,7 @@ void EnforceVectorizationImpl::findLoadsOfGlobal(
 }
 
 Value *
-EnforceVectorizationImpl::constructLoopPredicatePrefix(IRBuilder<> &Builder,
+WholeFunctionVectorizationImpl::constructLoopPredicatePrefix(IRBuilder<> &Builder,
                                                        Value *predicate) {
   // auto *VTy = VectorType::get(Builder.getInt1Ty(), GangSize, false);
   
@@ -771,7 +771,7 @@ EnforceVectorizationImpl::constructLoopPredicatePrefix(IRBuilder<> &Builder,
 
 // Starting with every load of the global and local id values, recursively walk
 // the data flow graph, applying vectorization to every instruction found.
-void EnforceVectorizationImpl::transformIdLoads() {
+void WholeFunctionVectorizationImpl::transformIdLoads() {
   IRBuilder<> Builder(M->getContext());
 
   // initialize masks with blank PHI nodes
@@ -853,7 +853,7 @@ void EnforceVectorizationImpl::transformIdLoads() {
   }
 }
 
-void EnforceVectorizationImpl::generateMasks() {
+void WholeFunctionVectorizationImpl::generateMasks() {
   IRBuilder<> Builder(M->getContext());
 
   // This is the second stage, which traverses the blocks in approximate order,
@@ -950,7 +950,7 @@ void EnforceVectorizationImpl::generateMasks() {
   }
 }
 
-void EnforceVectorizationImpl::transformControlFlow() {
+void WholeFunctionVectorizationImpl::transformControlFlow() {
   IRBuilder<> Builder(M->getContext());
 
   // After setting up all the masks with the phi, we need to merge branches into
@@ -1032,7 +1032,7 @@ void EnforceVectorizationImpl::transformControlFlow() {
   }
 }
 
-bool EnforceVectorizationImpl::privatizeContext() {
+bool WholeFunctionVectorizationImpl::privatizeContext() {
   CreateBuilder(Builder, F->getEntryBlock());
   if (VectorizedGlobalIdVar != nullptr) {
     AllocaInst *VectorizedGlobalIdAlloca =
@@ -1089,7 +1089,7 @@ static void eraseUsersRecursively(Value *V) {
   }
 }
 
-bool EnforceVectorizationImpl::processFunction(Function &F) {
+bool WholeFunctionVectorizationImpl::processFunction(Function &F) {
   std::vector<BasicBlock *> forInitBlocks;
   std::vector<BasicBlock *> forBodyBlocks;
   std::vector<BasicBlock *> forIncBlocks;
@@ -1112,7 +1112,7 @@ bool EnforceVectorizationImpl::processFunction(Function &F) {
 }
 
 llvm::PreservedAnalyses
-EnforceVectorization::run(llvm::Function &F,
+WholeFunctionVectorization::run(llvm::Function &F,
                           llvm::FunctionAnalysisManager &AM) {
   if (!isKernelToProcess(F))
     return llvm::PreservedAnalyses::all();
@@ -1130,7 +1130,7 @@ EnforceVectorization::run(llvm::Function &F,
   PAChanged.preserve<VariableUniformityAnalysis>();
   PAChanged.preserve<WorkitemHandlerChooser>();
 
-  EnforceVectorizationImpl WIL(DT, LI, PDT, VUA);
+  WholeFunctionVectorizationImpl WIL(DT, LI, PDT, VUA);
   // llvm::verifyFunction(F);
 
   return WIL.runOnFunction(F) ? PAChanged : PreservedAnalyses::all();
