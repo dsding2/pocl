@@ -124,30 +124,23 @@ private:
   llvm::Type *VectorST;
   llvm::Constant *SequentialVec;
   llvm::Constant *StepVec;
-  // first is the load inst, second is the (vectorized) replacement value
-  std::vector<std::pair<llvm::Instruction *, llvm::Value *>> LoadInsts;
 
   std::array<llvm::GlobalVariable *, 3> GlobalIdIterators;
   std::array<llvm::GlobalVariable *, 3> LocalIdIterators;
   std::unordered_set<llvm::Instruction *> markedForDeletion;
 
-  // contains all instructions that reference
-  // get_global/local_id(vectorization_dim) pair.first is the instruction,
-  // pair.second is a replacement value that loads from the vectorized ptr.
-  std::vector<std::pair<llvm::Value *, llvm::Value *>> LocalIdInsts;
-  std::vector<std::pair<llvm::Value *, llvm::Value *>> GlobalIdInsts;
-
   std::map<llvm::Instruction *, GraphNode> InstGraph;
-  // Given a basic block, get a vector containing pairs of the form
-  // <predecessor, mask value from predecessor>
-  std::map<llvm::BasicBlock *, std::map<llvm::BasicBlock *, llvm::Value *>>
-      BlockMaskPredecessors;
+
+  // Associates a basic block with its execution mask
   std::map<llvm::BasicBlock *, llvm::Value *> BlockMasks;
+
   // associates each loop with the mask before the loop began (since the mask
   // needs to reset to that value afterwards)
   std::map<llvm::Loop *, llvm::Value *> LoopMasks;
-  // Store all created calls that need a mask to be filled in later.
+
+  // Store all created calls that require a mask.
   std::set<std::pair<llvm::CallInst *, int>> maskedCalls;
+
   std::unordered_set<llvm::BranchInst *> branchInsts;
 
   // set of blocks with loop exiting branches
@@ -156,16 +149,11 @@ private:
   bool processFunction(llvm::Function &F);
 
   void markLoop(Loop *L);
-  void handleLoopMask(Loop *L);
   Constant *createConstantMask(IRBuilder<> &Builder, int N);
 
   Value *createVectorScalarAdd(IRBuilder<> &builder, Value *Vec, Value *Scalar);
-  void vectorizedHandleWorkitemFunctions();
 
-  Instruction *ConvertOpToMaskedIntrinsic(IRBuilder<> &Builder, Instruction *I,
-                                          Value *op1, Value *op2);
   void vectorizeInstruction(llvm::Instruction *I);
-  void wideLoadReplace(llvm::Instruction *I);
   void branchReplace(llvm::BranchInst *I);
   void vectorizedReplace(llvm::Instruction *I);
   void unvectorizedReplace(llvm::Instruction *I);
@@ -174,10 +162,6 @@ private:
   traverseInstructionTree(Instruction *I,
                           std::unordered_set<llvm::Instruction *> &visited);
 
-  void fixMultiRegionVariables(ParallelRegion *Region);
-  void addContextSaveRestore(llvm::Instruction *instruction);
-  void releaseParallelRegions();
-
   Constant *makeSequentialVector();
 
   void transformIdStores(BasicBlock *BB);
@@ -185,12 +169,11 @@ private:
   void transformIdLoads();
   Instruction *findIncrementOfGlobal(BasicBlock *BB, GlobalVariable *GV);
   void findLoadsOfGlobal(GlobalVariable *GV, std::vector<Instruction *> &Loads);
-  void transformControlFlow(BasicBlock *BB);
 
   bool blockHasTag(const BasicBlock *BB, StringRef Role);
 
-  // Given a typical predicate, it constructs the prefix from the predicate
-  // mask. That is, a predicate of 1101 becomes 1100, to represent the fact that
+  // Given a typical mask, it constructs the prefix from the mask
+  // mask. That is, a mask of 1101 becomes 1100, to represent the fact that
   // the loop should exit after the first 0.
   Value *constructLoopPredicatePrefix(IRBuilder<> &Builder, Value *predicate);
 
@@ -205,13 +188,7 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   // TODO add proper inference of gang size
   GangSize = 8;
   VectorizationDim = 0;
-  // if (WGLocalSizeX >= WGLocalSizeY && WGLocalSizeX >= WGLocalSizeZ) {
-  //   VectorizationDim = 0;
-  // } else if (WGLocalSizeY >= WGLocalSizeX && WGLocalSizeY >= WGLocalSizeZ) {
-  //   VectorizationDim = 1;
-  // } else {
-  //   VectorizationDim = 2;
-  // }
+
   VectorST = VectorType::get(ST, GangSize, false);
 
   SequentialVec = makeSequentialVector();
@@ -242,7 +219,6 @@ bool EnforceVectorizationImpl::runOnFunction(Function &Func) {
   Changed |= fixUndominatedVariableUses(DT, Func);
 
   Changed |= privatizeContext();
-  M->dump();
 
   return Changed;
 }
@@ -371,16 +347,11 @@ void EnforceVectorizationImpl::branchReplace(llvm::BranchInst *br) {
             constructLoopPredicatePrefix(Builder, condInst);
         cast<PHINode>(BlockMasks[br->getSuccessor(0)])
             ->addIncoming(newLoopPredicate, BB);
-        // BlockMaskPredecessors[br->getSuccessor(1)][br->getParent()] =
-        // nullptr;
         Value *newBrCond = Builder.CreateOrReduce(newLoopPredicate);
-        // BranchInst *newBr = Builder.CreateCondBr(newBrCond,
-        // br->getSuccessor(0), br->getSuccessor(1));
 
         Value *maskAllTrue = Builder.CreateAndReduce(BlockMasks[BB]);
         Value *finalCond = Builder.CreateAnd(newBrCond, maskAllTrue);
         br->setCondition(finalCond);
-        // markedForDeletion.insert(br);
       } else {
         Value *newMask = Builder.CreateAnd(BlockMasks[BB], condInst);
         cast<PHINode>(BlockMasks[br->getSuccessor(0)])
@@ -619,7 +590,7 @@ Value *EnforceVectorizationImpl::createVectorScalarAdd(IRBuilder<> &builder,
 }
 
 // Set up the vectorized global and local id. That is, initialize the vectors
-// <0, 1, 2,.., GangSize-1>.
+// as <0, 1, 2,.., GangSize-1>.
 void EnforceVectorizationImpl::transformIdStores(BasicBlock *BB) {
   // find init of global variable (which contains the offset as an operand)
   IRBuilder<> Builder(BB);
@@ -642,9 +613,6 @@ void EnforceVectorizationImpl::transformIdStores(BasicBlock *BB) {
       }
     }
   }
-
-  // TODO fix this (why was this like this??)
-  // Builder.CreateStore(SequentialVec, VectorizedLocalIdVar);
 }
 
 Instruction *
@@ -868,7 +836,7 @@ void EnforceVectorizationImpl::transformIdLoads() {
     return true;
   };
 
-  // Right now, we take all enabled as default. This breaks if GangSize <
+  // TODO: Right now, we take all enabled as default. This breaks if GangSize <
   // GlobalSize, and maybe some other edge cases
   Builder.SetInsertPoint(F->getEntryBlock().begin());
   // BlockMasks[&F->getEntryBlock()] = createConstantMask(Builder, GangSize);
@@ -1018,12 +986,6 @@ void EnforceVectorizationImpl::transformIdLoads() {
   }
 }
 
-void EnforceVectorizationImpl::transformControlFlow(BasicBlock *BB) {
-  if (loopBranches.count(BB) > 0) {
-    return;
-  }
-}
-
 bool EnforceVectorizationImpl::privatizeContext() {
   CreateBuilder(Builder, F->getEntryBlock());
   if (VectorizedGlobalIdVar != nullptr) {
@@ -1082,38 +1044,17 @@ static void eraseUsersRecursively(Value *V) {
 }
 
 bool EnforceVectorizationImpl::processFunction(Function &F) {
-  // vectorizedHandleWorkitemFunctions();
   std::vector<BasicBlock *> forInitBlocks;
   std::vector<BasicBlock *> forBodyBlocks;
   std::vector<BasicBlock *> forIncBlocks;
   for (auto &BB : F) {
-    if (auto *M = BB.getTerminator()->getMetadata("myrole")) {
-      auto *S = dyn_cast<MDString>(M->getOperand(0));
-      if (!S) {
-        continue;
-      }
-      if (S->getString() == "pregion_for_inc") {
-        // forIncBlocks.push_back(&BB);
-        transformForInc(&BB);
-      } else {
-        transformIdStores(&BB);
-      }
-      // if (S->getString() == "pregion_for_entry") {
-      //   // Note to self: search for other linked blocks when dealing with
-      //   this
-      //   // block
-      //   forBodyBlocks.push_back(&BB);
-      // }
-      // if (S->getString() == "pregion_for_init") {
-      //   forInitBlocks.push_back(&BB);
-      // }
+    if (blockHasTag(&BB, "pregion_for_inc")) {
+      // forIncBlocks.push_back(&BB);
+      transformForInc(&BB);
     } else {
       transformIdStores(&BB);
     }
   }
-  // for (BasicBlock *BB : forIncBlocks) {
-  //   transformForInc(BB);
-  // }
 
   transformIdLoads();
 
