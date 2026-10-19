@@ -146,7 +146,7 @@ private:
 
   bool processFunction(llvm::Function &F);
 
-  void markLoop(Loop *L);
+  bool markLoop(Loop *L);
   Constant *createConstantMask(IRBuilder<> &Builder, int N);
 
   Value *createVectorScalarAdd(IRBuilder<> &builder, Value *Vec, Value *Scalar);
@@ -210,11 +210,23 @@ bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
   VectorizedLocalIdVar = cast<GlobalVariable>(
       M->getOrInsertGlobal(LID_G_NAME_VECTORIZED, VectorST));
 
+  bool Changed = false;
+  
   for (Loop *L : LI.getLoopsInPreorder()) {
-    markLoop(L);
+    Changed |= markLoop(L);
   }
 
-  bool Changed = processFunction(Func);
+  if (Changed) {
+    DT.recalculate(Func);
+    PDT.recalculate(Func);
+  }
+
+  bool functionChanged = processFunction(Func);
+
+  if (!functionChanged) {
+    return Changed;
+  }
+  Changed |= functionChanged;
 
   Changed |= handleLocalMemAllocas();
 
@@ -242,27 +254,31 @@ Constant *WholeFunctionVectorizationImpl::createConstantMask(IRBuilder<> &Builde
   return ConstantVector::get(Elems);
 }
 
-void WholeFunctionVectorizationImpl::markLoop(Loop *L) {
+bool WholeFunctionVectorizationImpl::markLoop(Loop *L) {
+  bool changed = false;
   SmallVector<BasicBlock *, 4> exitingBlocks;
   L->getExitingBlocks(exitingBlocks);
 
-  assert(exitingBlocks.size() == 1);
-  BranchInst *br = dyn_cast<BranchInst>(exitingBlocks[0]->getTerminator());
-  assert(br && br->isConditional());
-  Value *cond = br->getCondition();
+  for (BasicBlock *BB : exitingBlocks) {
+    BranchInst *br = dyn_cast<BranchInst>(BB->getTerminator());
+    assert(br && br->isConditional());
+    Value *cond = br->getCondition();
 
-  bool trueContinuesLoop = L->contains(br->getSuccessor(0));
-  if (!trueContinuesLoop) {
-    IRBuilder<> Builder(br->getParent());
-    Builder.SetInsertPoint(br);
-    Value *condInv = Builder.CreateNot(cond);
+    bool trueContinuesLoop = L->contains(br->getSuccessor(0));
+    if (!trueContinuesLoop) {
+      IRBuilder<> Builder(br->getParent());
+      Builder.SetInsertPoint(br);
+      Value *condInv = Builder.CreateNot(cond);
 
-    BasicBlock *tmp = br->getSuccessor(0);
-    br->setSuccessor(0, br->getSuccessor(1));
-    br->setSuccessor(1, tmp);
-    br->setCondition(condInv);
+      BasicBlock *tmp = br->getSuccessor(0);
+      br->setSuccessor(0, br->getSuccessor(1));
+      br->setSuccessor(1, tmp);
+      br->setCondition(condInv);
+      changed = true;
+    }
+    loopBranches.insert(br->getParent());
   }
-  loopBranches.insert(br->getParent());
+  return changed;
 }
 
 Constant *WholeFunctionVectorizationImpl::makeSequentialVector() {
@@ -295,7 +311,16 @@ void WholeFunctionVectorizationImpl::vectorizeInstruction(llvm::Instruction *I) 
   } else if (isVectorizableInstruction(I)) {
       vectorizedReplace(I);
   } else {
-    I->dump();
+    // assert(false);
+    if (I->getOpcode() == Instruction::Call) {
+      if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+        if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+            II->getIntrinsicID() == Intrinsic::lifetime_end) {
+          return;
+        }
+      }
+    }
+    // I->dump();
     unvectorizedReplace(I);
   }
 }
@@ -331,10 +356,13 @@ void WholeFunctionVectorizationImpl::branchReplace(llvm::BranchInst *br) {
       }
       InstGraph[condInst].valueOutput = cast<Instruction>(vec);
     }
-
     condInst = InstGraph[condInst].valueOutput;
     IRBuilder<> Builder(condInst->getParent());
 
+    // TODO: fix this. in the case of for_cond blocks, maintaining the masks in
+    // this way is massively overkill if we switch equality comps to geq.
+    // Even in other cases, we don't need nearly as much overhead. Just zero out all masks
+    // after the first false.
     if (loopBranches.count(br->getParent()) > 0) {
       Builder.SetInsertPoint(br);
       // For loop predicates in the pregion_for_cond blocks, any false means that all future mask values must
@@ -358,6 +386,8 @@ void WholeFunctionVectorizationImpl::branchReplace(llvm::BranchInst *br) {
       }
 
     } else {
+      // Note that we don't change the condition of the branch here,
+      // as there is a good chance this branch becomes unconditional for masking reasons.
       Builder.SetInsertPoint(condInst->getNextNode());
       Value *inv = Builder.CreateNot(condInst);
       cast<PHINode>(BlockMasks[br->getSuccessor(0)])->addIncoming(condInst, BB);
@@ -848,10 +878,10 @@ void WholeFunctionVectorizationImpl::transformIdLoads() {
   }
 
   // TODO: is this redundant with eraseUsersRecursively?
-  for (Instruction *inst : markedForDeletion) {
-    inst->replaceAllUsesWith(PoisonValue::get(inst->getType()));
-    inst->eraseFromParent();
-  }
+  // for (Instruction *inst : markedForDeletion) {
+  //   inst->replaceAllUsesWith(PoisonValue::get(inst->getType()));
+  //   inst->eraseFromParent();
+  // }
 }
 
 void WholeFunctionVectorizationImpl::generateMasks() {
@@ -884,6 +914,7 @@ void WholeFunctionVectorizationImpl::generateMasks() {
   for (BasicBlock *BB : successors(&F->getEntryBlock())) {
     Worklist.push_back(BB);
   }
+  std::unordered_set<BasicBlock *> Visited;
 
   while (!Worklist.empty()) {
     BasicBlock *BB = Worklist.front();
@@ -942,12 +973,12 @@ void WholeFunctionVectorizationImpl::generateMasks() {
       }
     }
     // BlockMasks[BB] = phi;
-
-    if (changed) {
+    if (changed || Visited.count(BB) == 0) {
       for (BasicBlock *succ : successors(BB)) {
         Worklist.push_back(succ);
       }
     }
+    Visited.insert(BB);
   }
 }
 
@@ -960,7 +991,38 @@ void WholeFunctionVectorizationImpl::transformControlFlow() {
   for (BranchInst *br : branchInsts) {
     BasicBlock *trueBB = br->getSuccessor(0);
     BasicBlock *falseBB = br->getSuccessor(1);
+
     BasicBlock *mergeBB = PDT.findNearestCommonDominator(trueBB, falseBB);
+
+    // In the case of divergent control flow conditioned on something that is dependent on a vectorized value,
+    // we just take the value of the last loop (which is what pocl was already doing).
+    if (!mergeBB) {
+      Instruction *condInst = dyn_cast<Instruction>(br->getCondition());
+      assert(condInst && InstGraph.count(condInst) > 0 && "Condition must be an instruction in the graph");
+      Builder.SetInsertPoint(br);
+
+      Value *cond = InstGraph[condInst].valueOutput;
+
+      auto *VecTy = cast<FixedVectorType>(cond->getType());
+      unsigned N = GangSize;
+
+      // Convert the mask to an integer bitmask.
+      Type *IntTy = Builder.getIntNTy(N);
+      Value *Bits = Builder.CreateBitCast(BlockMasks[br->getParent()], IntTy);
+
+      // Find the highest set bit.
+      Value *LeadingZeros = Builder.CreateBinaryIntrinsic(
+          Intrinsic::ctlz, Bits, Builder.getFalse());
+
+      Value *LastIdx = Builder.CreateSub(
+          ConstantInt::get(IntTy, N - 1),
+          LeadingZeros);
+
+      // Extract the boolean at that index.
+      Value *newCond = Builder.CreateExtractElement(cond, LastIdx);
+      br->setCondition(newCond);
+      continue;
+    }
 
     std::unordered_set<BasicBlock *> trueBBMergePreds;
     std::unordered_set<BasicBlock *> falseBBMergePreds;
@@ -971,6 +1033,9 @@ void WholeFunctionVectorizationImpl::transformControlFlow() {
         continue;
 
       SmallPtrSet<BasicBlock *, 1> exclusionSet({mergeBB});
+      // TODO: isPotentiallyReachable is not strict, which can lead to cases where a predecessor is believed to be reachable from both branches.
+      // when it isn't. Note that in the case of a true positive, that a merge block predecessor is actually reachable from both branches, the
+      // entire masking system is fundamentally incapable of handling it.
       if (isPotentiallyReachable(trueBB, Pred, &exclusionSet)) {
         trueBBMergePreds.insert(Pred);
       }
@@ -991,11 +1056,13 @@ void WholeFunctionVectorizationImpl::transformControlFlow() {
 
     // If the true branch has no blocks, then the branch block should point directly to the falsePhiNodes instead
     if (trueBBMergePreds.empty()) {
+      // llvm::errs() << "true branch has no blocks, rerouting to false branch\n";
       trueBBMergePreds.insert(br->getParent());
       trueBB = falseBB;
     }
     PHINode *MergeMask = cast<PHINode>(BlockMasks[mergeBB]);
-    for (BasicBlock *trueBBMergePred : trueBBMergePreds) {
+
+    for (BasicBlock *trueBBMergePred : trueBBMergePreds){
       BranchInst *mergePredBr =
           cast<BranchInst>(trueBBMergePred->getTerminator());
       for (int i = 0; i < mergePredBr->getNumSuccessors(); i++) {
@@ -1042,11 +1109,12 @@ void WholeFunctionVectorizationImpl::applyMasks() {
     if (auto *SI = dyn_cast<StoreInst>(I)) {
       BasicBlock *BB = SI->getParent();
       if (auto *M = BB->getTerminator()->getMetadata("myrole")) {
-        auto *S = dyn_cast<MDString>(M->getOperand(0));
-        if (S && (S->getString() == "pregion_for_inc" ||
-                  S->getString() == "pregion_for_init")) {
-          continue;
-        }
+        // auto *S = dyn_cast<MDString>(M->getOperand(0));
+        // if (S && (S->getString() == "pregion_for_inc" ||
+        //           S->getString() == "pregion_for_init")) {
+        //   continue;
+        // }
+        continue;
       }
 
       if (SI->getParent()->getName() == "entry.barrier") {
@@ -1067,8 +1135,6 @@ void WholeFunctionVectorizationImpl::applyMasks() {
 
       BlockMasks[StoreBB] = BlockMasks[BB];
       BlockMasks[StoreBB->getNextNode()] = BlockMasks[BB];
-
-
     }
   }
 
@@ -1138,6 +1204,18 @@ bool WholeFunctionVectorizationImpl::processFunction(Function &F) {
   std::vector<BasicBlock *> forInitBlocks;
   std::vector<BasicBlock *> forBodyBlocks;
   std::vector<BasicBlock *> forIncBlocks;
+
+  bool shouldVectorize = false;
+  for (auto &BB : F) {
+    if (blockHasTag(&BB, "pregion_for_inc")) {
+      shouldVectorize = true;
+      break;
+    }
+  }
+  if (!shouldVectorize) {
+    return false;
+  }
+
   for (auto &BB : F) {
     if (blockHasTag(&BB, "pregion_for_inc")) {
       // forIncBlocks.push_back(&BB);
