@@ -58,6 +58,7 @@ IGNORE_COMPILER_WARNING("-Wunused-parameter")
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/IR/InstIterator.h>
 
 #include "WholeFunctionVectorization.h"
@@ -183,8 +184,6 @@ private:
 
   bool processFunction(llvm::Function &F);
 
-  bool forceInlineAllCalls(Function &F);
-
   bool markLoop(Loop *L);
   Constant *createConstantMask(IRBuilder<> &Builder, int N);
 
@@ -222,7 +221,64 @@ private:
   bool privatizeContext();
 };
 
+// Repeated inlining must not expand recursive call cycles indefinitely.
+static bool isRecursiveCallee(Function &Callee) {
+  SmallVector<Function *, 16> Worklist;
+  SmallPtrSet<Function *, 32> Visited;
+  Worklist.push_back(&Callee);
+  while (!Worklist.empty()) {
+    Function *Current = Worklist.pop_back_val();
+    if (!Visited.insert(Current).second)
+      continue;
+    for (Instruction &I : instructions(Current)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      Function *Target = CB ? CB->getCalledFunction() : nullptr;
+      if (Target == &Callee)
+        return true;
+      if (Target && !Target->isDeclaration())
+        Worklist.push_back(Target);
+    }
+  }
+  return false;
+}
+
+static bool forceInlineAllCalls(Function &F) {
+  bool Changed = false;
+  bool Progress;
+  do {
+    Progress = false;
+    for (Instruction &I : instructions(F)) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      Function *Callee = CI ? CI->getCalledFunction() : nullptr;
+      if (!Callee || Callee->isDeclaration() || Callee == &F)
+        continue;
+
+      // TODO: the pass only handles branches and returns, so we are gonna avoid inlining everything
+      // else for now, which is obviously pretty hacky.
+      bool Supported = true;
+      for (BasicBlock &BB : *Callee) {
+        Instruction *Term = BB.getTerminator();
+        if (!isa<BranchInst>(Term) && !isa<ReturnInst>(Term)) {
+          Supported = false;
+          break;
+        }
+      }
+      if (!Supported || isRecursiveCallee(*Callee))
+        continue;
+
+      InlineFunctionInfo IFI;
+      if (InlineFunction(*CI, IFI).isSuccess()) {
+        Changed = Progress = true;
+        break; // Inlining invalidates the iterator; rescan newly added calls.
+      }
+    }
+  } while (Progress);
+  return Changed;
+}
+
 bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
+
+
   M = Func.getParent();
 
   F = &Func;
@@ -251,14 +307,17 @@ bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
   VectorizedLocalIdVar = cast<GlobalVariable>(
       M->getOrInsertGlobal(LID_G_NAME_VECTORIZED, VectorST));
 
+  bool Changed = forceInlineAllCalls(Func);
+  if (Changed) {
+    DT.recalculate(Func);
+    PDT.recalculate(Func);
+    LI.releaseMemory();
+    LI.analyze(DT);
+    VUA.runOnFunction(Func, LI, PDT);
+  }
+
   analyzeMaskRequirements();
 
-  bool Changed = false;
-
-  // Changed |= forceInlineAllCalls(Func);
-
-  // printModule(*M, "wfv_inlined");
-  
   for (Loop *L : LI.getLoopsInPreorder()) {
     Changed |= markLoop(L);
   }
@@ -353,47 +412,6 @@ void WholeFunctionVectorizationImpl::analyzeMaskRequirements() {
   }
 }
 
-bool WholeFunctionVectorizationImpl::forceInlineAllCalls(Function &F) {
-    bool Changed = false;
-    bool Progress = true;
-
-    while (Progress) {
-        Progress = false;
-
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                auto *CB = dyn_cast<CallBase>(&I);
-                if (!CB)
-                    continue;
-
-                Function *Callee = CB->getCalledFunction();
-
-                // Skip indirect calls, declarations, and recursive calls.
-                if (!Callee || Callee->isDeclaration() || Callee == &F)
-                    continue;
-
-                // InlineFunction supports CallInst and InvokeInst,
-                // but not CallBrInst.
-                if (!isa<CallInst>(CB) && !isa<InvokeInst>(CB))
-                    continue;
-
-                InlineFunctionInfo IFI;
-                InlineResult Result = InlineFunction(*CB, IFI);
-
-                if (Result.isSuccess()) {
-                    Changed = true;
-                    Progress = true;
-                    break; // Iterator invalidated; restart traversal.
-                }
-            }
-
-            if (Progress)
-                break;
-        }
-    }
-
-    return Changed;
-}
 
 
 Constant *WholeFunctionVectorizationImpl::createConstantMask(IRBuilder<> &Builder,
@@ -935,6 +953,11 @@ void WholeFunctionVectorizationImpl::unvectorizedReplace(llvm::Instruction *I) {
     for (auto &[j, changedOperandArr] : changedOperands) {
       newInst->setOperand(j, changedOperandArr[i]);
     }
+    if (isa<StoreInst>(newInst))
+      newInst->setMetadata(
+          "pocl.wfv.lane",
+          MDNode::get(M->getContext(),
+                      ConstantAsMetadata::get(Builder.getInt32(i))));
     InstGraph[I].arrayOutput.push_back(newInst);
     Builder.Insert(newInst);
   }
@@ -1480,9 +1503,16 @@ void WholeFunctionVectorizationImpl::applyMasks() {
 
       IRBuilder<> Builder(SI);
 
-      // Reduce <8 x i1> -> i1
-      Value *AnyMask = Builder.CreateOrReduce(BlockMasks[BB]);
-      Instruction *ThenTerm = SplitBlockAndInsertIfThen(AnyMask, SI, false);
+      // Split stores belong to one work-item lane; other scalar stores
+      // execute whenever any lane in the block is active.
+      Value *StoreMask;
+      if (MDNode *Lane = SI->getMetadata("pocl.wfv.lane")) {
+        auto *Index = mdconst::extract<ConstantInt>(Lane->getOperand(0));
+        StoreMask = Builder.CreateExtractElement(BlockMasks[BB], Index);
+      } else {
+        StoreMask = Builder.CreateOrReduce(BlockMasks[BB]);
+      }
+      Instruction *ThenTerm = SplitBlockAndInsertIfThen(StoreMask, SI, false);
 
       BasicBlock *StoreBB = ThenTerm->getParent();
       
