@@ -161,6 +161,8 @@ private:
 
   // Computed on the original CFG. Missing/new blocks conservatively need masks.
   std::map<llvm::BasicBlock *, bool> RequiresMask;
+  std::set<llvm::Loop *> UnmaskedLoops;
+  std::set<llvm::Loop *> FullGangLoops;
   void analyzeMaskRequirements();
   bool requiresMask(BasicBlock *BB) const {
     auto It = RequiresMask.find(BB);
@@ -213,9 +215,6 @@ private:
 
   bool blockHasTag(const BasicBlock *BB, StringRef Role);
 
-  // Given a typical mask, it constructs the prefix from the mask
-  // mask. That is, a mask of 1101 becomes 1100, to represent the fact that
-  // the loop should exit after the first 0.
   Value *constructLoopPredicatePrefix(IRBuilder<> &Builder, Value *predicate);
 
   bool privatizeContext();
@@ -343,18 +342,35 @@ bool WholeFunctionVectorizationImpl::runOnFunction(Function &Func) {
   return Changed;
 }
 
-// Only work-item loops with full gangs may omit masks. Ordinary loops and
-// blocks outside work-item loops retain masking, regardless of their CFG.
+// Analyze ID dependence before rewriting the scalar CFG. A loop can reuse its
+// incoming mask without proving that all lanes of that mask are active.
 void WholeFunctionVectorizationImpl::analyzeMaskRequirements() {
   const unsigned long LocalSizes[] = {WGLocalSizeX, WGLocalSizeY, WGLocalSizeZ};
   const bool FullGangs = !WGDynamicLocalSize &&
                         LocalSizes[VectorizationDim] != 0 &&
                         LocalSizes[VectorizationDim] % GangSize == 0;
+  SmallPtrSet<Instruction *, 32> Varying;
+  std::vector<Instruction *> Loads;
+
+  // TODO: yes, this does calculate load dependencies twice, entirely unnecessarily.
+  // Should refactor later to avoid this.
+  findLoadsOfGlobal(LocalIdIterators[VectorizationDim], Loads);
+  findLoadsOfGlobal(GlobalIdIterators[VectorizationDim], Loads);
+  SmallVector<Instruction *, 16> Worklist(Loads.begin(), Loads.end());
+  while (!Worklist.empty()) {
+    Instruction *I = Worklist.pop_back_val();
+    if (!Varying.insert(I).second)
+      continue;
+    for (User *U : I->users())
+      if (auto *UI = dyn_cast<Instruction>(U))
+        Worklist.push_back(UI);
+  }
+
   RequiresMask.clear();
+  UnmaskedLoops.clear();
+  FullGangLoops.clear();
   for (BasicBlock &BB : *F)
     RequiresMask[&BB] = true;
-  if (!FullGangs)
-    return;
 
   SmallPtrSet<Loop *, 16> WorkItemLoops;
   for (Loop *L : LI.getLoopsInPreorder()) {
@@ -367,15 +383,34 @@ void WholeFunctionVectorizationImpl::analyzeMaskRequirements() {
       }
   }
 
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    bool HasMemory = false;
+    bool VaryingExit = false;
+    for (BasicBlock *BB : L->getBlocks()) {
+      for (Instruction &I : *BB)
+        HasMemory |= isa<LoadInst>(I) || isa<StoreInst>(I);
+      if (L->isLoopExiting(BB)) {
+        auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+        VaryingExit |= !Br || (Br->isConditional() &&
+                              Varying.count(dyn_cast<Instruction>(
+                                  Br->getCondition())));
+      }
+    }
+    if (FullGangs && WorkItemLoops.count(L))
+      FullGangLoops.insert(L);
+    if (!HasMemory || !VaryingExit || FullGangLoops.count(L))
+      UnmaskedLoops.insert(L);
+  }
+
   for (BasicBlock &BB : *F) {
     Loop *L = LI.getLoopFor(&BB);
-    if (!L || !WorkItemLoops.count(L) || !DT.isReachableFromEntry(&BB))
+    if (!FullGangs || !L || !DT.isReachableFromEntry(&BB))
       continue;
-    // An ordinary enclosing subloop may itself have a partial execution mask.
+    // A divergent enclosing loop may leave only part of the gang active.
     bool OrdinaryAncestor = false;
-    for (Loop *Parent = L->getParentLoop(); Parent;
+    for (Loop *Parent = L; Parent;
          Parent = Parent->getParentLoop())
-      OrdinaryAncestor |= !WorkItemLoops.count(Parent);
+      OrdinaryAncestor |= !UnmaskedLoops.count(Parent);
     if (!OrdinaryAncestor)
       RequiresMask[&BB] = false;
   }
@@ -388,8 +423,12 @@ void WholeFunctionVectorizationImpl::analyzeMaskRequirements() {
     Instruction *Term = BB.getTerminator();
     if (Term->getNumSuccessors() < 2 || !DT.isReachableFromEntry(&BB))
       continue;
+    auto *Br = dyn_cast<BranchInst>(Term);
+    if (Br && Br->isConditional() &&
+        !Varying.count(dyn_cast<Instruction>(Br->getCondition())))
+      continue;
     Loop *L = LI.getLoopFor(&BB);
-    if (L && WorkItemLoops.count(L) &&
+    if (L && FullGangLoops.count(L) &&
         blockHasTag(&BB, "pregion_for_cond"))
       continue;
 
@@ -655,17 +694,18 @@ void WholeFunctionVectorizationImpl::branchReplace(llvm::BranchInst *br) {
     condInst = InstGraph[condInst].valueOutput;
     IRBuilder<> Builder(condInst->getParent());
 
-    if (!requiresMask(BB) && blockHasTag(BB, "pregion_for_cond") &&
-        loopBranches.count(BB)) {
+    if (loopBranches.count(BB) &&
+        UnmaskedLoops.count(LI.getLoopFor(BB))) {
       Builder.SetInsertPoint(br);
-      // Full gangs make every lane agree on the work-item loop condition.
-      // Keep the mask PHI plumbing for contained branches, but bypass the
-      // predicate mask updates and reductions for this loop backedge.
-      Value *FullMask = Constant::getAllOnesValue(condInst->getType());
-      cast<PHINode>(BlockMasks[br->getSuccessor(0)])
-          ->addIncoming(FullMask, BB);
-      br->setCondition(Builder.CreateExtractElement(
-          condInst, Builder.getInt32(0), "workitem.loop.condition"));
+      // Reuse the enclosing mask. Only full work-item gangs justify taking
+      // lane zero; memory-free divergent loops still reduce their predicates.
+      Value *Condition;
+      if (FullGangLoops.count(LI.getLoopFor(BB)))
+        Condition = Builder.CreateExtractElement(
+            condInst, Builder.getInt32(0), "workitem.loop.condition");
+      else
+        Condition = Builder.CreateOrReduce(condInst);
+      br->setCondition(Condition);
       return;
     }
 
@@ -1311,7 +1351,8 @@ void WholeFunctionVectorizationImpl::generateMasks() {
     for (BasicBlock *Pred : predecessors(BB)) {
       Value *Incoming = nullptr;
       for (Loop *L = LI.getLoopFor(Pred); L; L = L->getParentLoop()) {
-        if (L->isLoopExiting(Pred) && !L->contains(BB) && LoopMasks[L]) {
+        if (L->isLoopExiting(Pred) && !L->contains(BB) &&
+            LoopMasks.count(L)) {
           Incoming = LoopMasks[L];
           break;
         }
@@ -1333,7 +1374,8 @@ void WholeFunctionVectorizationImpl::generateMasks() {
       // Assumes that each loop header only has one direct predecessor. If this
       // assumption breaks, change this to regenerate the phi clone if changed
       // == true instead.
-      if (LoopMasks.count(L) == 0 && L->getHeader() == BB) {
+      if (!UnmaskedLoops.count(L) && LoopMasks.count(L) == 0 &&
+          L->getHeader() == BB) {
         PHINode *phiClone = cast<PHINode>(phi->clone());
         for (BasicBlock *Pred : predecessors(BB)) {
           if (L->contains(Pred)) {

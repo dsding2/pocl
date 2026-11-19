@@ -656,8 +656,8 @@ static bool runKernelCompilerPasses(cl_device_id Device, llvm::Module &Mod,
   addStage2PassesToPipeline(Device, Passes2);
   std::string P2 = convertPassesToPipelineString(Passes2);
 
-  // Error E = PM.build(Device, P1, Optimize ? 1 : 0, 0, P2, Optimize ? 3 : 0, 0);
-  Error E = PM.build(Device, P1, Optimize ? 1 : 0, 0, P2, 0, 0);
+  Error E = PM.build(Device, P1, Optimize ? 1 : 0, 0, P2, Optimize ? 3 : 0, 0);
+  // Error E = PM.build(Device, P1, Optimize ? 1 : 0, 0, P2, 0, 0);
   if (E) {
     std::cerr << "LLVM: failed to create compilation pipeline";
     return false;
